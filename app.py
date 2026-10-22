@@ -32,7 +32,7 @@ ALLOWED_ORIGINS = {f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}"}
 AUDIENCE, ME = "聽眾", "我"
 CHANNELS = {0: AUDIENCE, 1: ME}  # first byte of each binary audio frame
 WINDOW_LINES = 40  # transcript lines sent with each request
-WAIT_FORCE_SECONDS = 6.0  # after a WAIT, answer anyway once the audience has been quiet this long
+WAIT_FORCE_SECONDS = 5.0  # after a WAIT, answer anyway once the audience has been quiet this long
 FORCE_NOTE = "對方已經停下來了，請直接處理，不要再輸出 WAIT。"
 NOW_NOTE = "講者按了「現在回答」：請回答最近一個聽眾問題，不要輸出 SKIP 或 WAIT。"
 
@@ -207,16 +207,18 @@ async def ws_endpoint(ws: WebSocket) -> None:
         with transcript_path.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
         await send({"type": "final", "speaker": speaker, "line": line})
-        if speaker == AUDIENCE and segmenter.add_final(text, time.monotonic()):
+        if speaker == AUDIENCE:
+            # Gemini only finalizes a line at the end of an utterance, so judge it now rather than
+            # after a further pause; speech that follows cancels the judgment (audience_still_talking).
+            segmenter.add_final(text, time.monotonic())
             spawn(on_audience_pause())
 
     async def ticker() -> None:
         while True:
             await asyncio.sleep(0.5)
             now = time.monotonic()
-            if segmenter.tick(now):
-                spawn(on_audience_pause())
-            elif flags["waiting"] and now - segmenter.last_activity >= WAIT_FORCE_SECONDS:
+            segmenter.tick(now)  # only clears the finished utterance; it was judged on its final line
+            if flags["waiting"] and now - segmenter.last_activity >= WAIT_FORCE_SECONDS:
                 flags["waiting"] = False
                 spawn(evaluate(FORCE_NOTE))
 

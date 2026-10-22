@@ -1,7 +1,7 @@
 """Answer audience questions about SurgiFlowVid with Claude, grounded in the paper and talk notes."""
 
-import base64
 import re
+import subprocess
 import sys
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -18,9 +18,11 @@ SCRIPT = ROOT / "SurgiFlowVid_speaker_script.md"
 OUTLINE = ROOT / "SurgiFlowVid_seminar_outline.md"
 DECK = ROOT / "deck/slides/surgiflowvid-seminar/index.tsx"
 
-# Sonnet 5.5 at low effort: full answers in about 10 s vs 14 s on Opus 5.5 (measured 2026-10-23).
+# Measured 2026-10-23 on the same question: Opus 5.5 13.6 s, Sonnet 5.5 with thinking and the PDF
+# 10-15 s, Sonnet 5.5 without thinking and the paper as page text 5.9 s (first text 1.9 s).
 MODEL = "claude-sonnet-5-5"
 EFFORT = "low"
+THINKING = {"type": "between_tools"}  # Sonnet 5.5's way to turn thinking off
 MAX_TOKENS = 16000
 BETAS = ["server-side-fallback-2026-07-01"]
 SKIP = "SKIP"
@@ -49,7 +51,8 @@ SYSTEM = """你是講者的即時 Q&A 助手。講者黃士峰（大腸直腸外
 - 講者筆記裡已經整理過的題目（Q&A 預備、原文對不上的地方），優先沿用，但數字以原文為準。
 - 講者自己（「我」）已經回答了一部分時，口語稿要接著補充，不要重複他已經說過的。
 - 聽眾問題常常斷斷續續、被停頓切成好幾行，要把同一個人連續的幾行合起來理解。如果聽眾是在補充或修正一個已經回答過的問題，就重新給一份完整的回答，並在【問題】開頭寫「（更新）」。
-- 不要在回答最後另外列出原文句子，原文引句會由系統附在卡片下方。"""
+- 不要在回答最後另外列出原文句子，原文引句會由系統附在卡片下方。
+- 講者不是這篇論文的作者。口語稿提到論文的做法時要說「作者」或「論文」，不要說「我們」。"""
 
 
 def _deck_map() -> str:
@@ -58,24 +61,38 @@ def _deck_map() -> str:
     return "\n".join(lines)
 
 
-def build_context() -> list[dict]:
-    """The cached prefix: the paper PDF plus the talk materials. Must stay byte-identical."""
-    pdf = base64.standard_b64encode(PAPER.read_bytes()).decode("ascii")
+def paper_pages() -> list[tuple[int, str]]:
+    """The paper as (page number, text) per non-empty page.
+
+    Page text instead of the PDF halves the context (88k vs 173k tokens) and was much faster;
+    tables survive pdftotext -layout well enough that table numbers were still answered correctly.
+    """
+    text = subprocess.run(
+        ["pdftotext", "-layout", str(PAPER), "-"], check=True, capture_output=True, text=True
+    )
+    return [(n, page) for n, page in enumerate(text.stdout.split("\f"), 1) if page.strip()]
+
+
+def build_context() -> tuple[list[dict], list[int]]:
+    """The cached prefix (paper pages + talk materials) and the page number of each paper block."""
+    pages = paper_pages()
     notes = (
         "以下是講者自己的材料，不是論文原文。\n\n"
         f"## 投影片頁碼對照\n{_deck_map()}\n\n"
         f"## 講稿\n{SCRIPT.read_text()}\n\n"
         f"## 講者大綱與筆記（含 Q&A 預備和講者的分析）\n{OUTLINE.read_text()}"
     )
-    return [
-        {
-            "type": "document",
-            "source": {"type": "base64", "media_type": "application/pdf", "data": pdf},
-            "title": "SurgiFlowVid (ICML 2026) 論文原文",
-            "citations": {"enabled": True},
+    paper = {
+        "type": "document",
+        "source": {
+            "type": "content",
+            "content": [{"type": "text", "text": f"[論文第 {n} 頁]\n{text}"} for n, text in pages],
         },
-        {"type": "text", "text": notes, "cache_control": {"type": "ephemeral", "ttl": "1h"}},
-    ]
+        "title": "SurgiFlowVid (ICML 2026) 論文原文，逐頁文字",
+        "citations": {"enabled": True},
+    }
+    notes_block = {"type": "text", "text": notes, "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+    return [paper, notes_block], [n for n, _ in pages]
 
 
 @dataclass
@@ -106,11 +123,12 @@ def _request_block(transcript: list[str], answered: list[str], note: str = "") -
     return {"type": "text", "text": "\n\n".join(parts)}
 
 
-def _citations(message) -> list[Citation]:
+def _citations(message, page_numbers: list[int]) -> list[Citation]:
     seen, out = set(), []
     for block in message.content:
         for c in getattr(block, "citations", None) or []:
-            page = getattr(c, "start_page_number", None)
+            index = getattr(c, "start_block_index", None)
+            page = page_numbers[index] if index is not None and index < len(page_numbers) else None
             text = re.sub(r"\s+", " ", getattr(c, "cited_text", "")).strip()
             if page is None or (page, text) in seen:
                 continue
@@ -122,7 +140,7 @@ def _citations(message) -> list[Citation]:
 class Answerer:
     def __init__(self, api_key: str) -> None:
         self.client = anthropic.AsyncAnthropic(api_key=api_key)
-        self.context = build_context()
+        self.context, self.page_numbers = build_context()
 
     def _params(self, content: list[dict], max_tokens: int) -> dict:
         return {
@@ -130,6 +148,7 @@ class Answerer:
             "max_tokens": max_tokens,
             "system": SYSTEM,
             "output_config": {"effort": EFFORT},
+            "thinking": THINKING,
             "betas": BETAS,
             "fallbacks": "default",
             "messages": [{"role": "user", "content": content}],
@@ -154,4 +173,4 @@ class Answerer:
             status = "refused"
         else:
             status = {SKIP: "skip", WAIT: "wait"}.get(text, "answer")
-        yield Answer(text=text, citations=_citations(message), status=status)
+        yield Answer(text=text, citations=_citations(message, self.page_numbers), status=status)

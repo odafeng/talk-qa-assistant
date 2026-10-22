@@ -47,9 +47,11 @@ def test_deck_map_lists_every_page_and_marks_backup():
     assert lines[44].endswith("（Backup）") and not lines[43].endswith("（Backup）")
 
 
-def test_context_caches_the_notes_after_the_pdf():
-    pdf, notes = answerer.build_context()
-    assert pdf["type"] == "document" and pdf["citations"] == {"enabled": True}
+def test_context_sends_the_paper_as_page_text_and_caches_the_notes():
+    (paper, notes), pages = answerer.build_context()
+    blocks = paper["source"]["content"]
+    assert paper["citations"] == {"enabled": True} and len(blocks) == len(pages) >= 25
+    assert blocks[0]["text"].startswith(f"[論文第 {pages[0]} 頁]")
     assert notes["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert "Q&A 預備" in notes["text"] and "第 44 頁" in notes["text"]
 
@@ -68,14 +70,16 @@ def test_answer_status_and_question_extraction():
 
 
 def test_citations_are_deduplicated_and_keep_page_numbers():
-    cite = SimpleNamespace(start_page_number=7, cited_text="flow is used\n only in training")
+    cite = SimpleNamespace(start_block_index=1, cited_text="flow is used\n only in training")
     message = SimpleNamespace(
         content=[
             SimpleNamespace(citations=[cite, cite]),
             SimpleNamespace(citations=None),
         ]
     )
-    assert answerer._citations(message) == [answerer.Citation(page=7, text="flow is used only in training")]
+    assert answerer._citations(message, [1, 7, 8]) == [
+        answerer.Citation(page=7, text="flow is used only in training")
+    ]
 
 
 ORIGIN = {"origin": "http://localhost:8777"}
