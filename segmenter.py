@@ -44,6 +44,10 @@ class Segmenter:
         return None
 
     @property
+    def last_activity(self) -> float:
+        return self._last_activity
+
+    @property
     def pending(self) -> str:
         return " ".join(self._parts)
 

@@ -23,24 +23,30 @@ EFFORT = "low"
 MAX_TOKENS = 16000
 BETAS = ["server-side-fallback-2026-07-01"]
 SKIP = "SKIP"
+WAIT = "WAIT"
 
-SYSTEM = """你是講者的即時 Q&A 助手。講者黃士峰（大腸直腸外科醫師、博士生）正在 IIR seminar 線上報告 SurgiFlowVid（Venkatesh et al., ICML 2026）。你收到的是會議中「其他人」說話的自動逐字稿，可能有辨識錯字，也可能根本不是問題。
+SYSTEM = """你是講者的即時 Q&A 助手。講者黃士峰（大腸直腸外科醫師、博士生）正在 IIR seminar 線上報告 SurgiFlowVid（Venkatesh et al., ICML 2026），現在是提問時間。
 
-先判斷：如果這段話不是在問跟這場報告、這篇論文或相關研究有關的問題（例如寒暄、「聽得到嗎」、「謝謝」、主持人串場、跟論文無關的閒聊），只輸出 SKIP 這四個字母，不要輸出其他任何東西。
+你會收到會議的自動逐字稿（可能有辨識錯字）。每一行標了說話的人：「聽眾」是 Meet 裡其他人的聲音（提問者、主持人），「我」是講者自己的麥克風。逐字稿沒有區分不同的聽眾，同一個聽眾的問題也可能被停頓切成好幾行。
 
-如果是問題，用下面的格式回答，整體要短，講者要能在幾秒內看完：
+你的工作：找出聽眾最近提出、而且還沒回答過的問題，給講者一份可以直接唸的口語稿。
 
-【問題】用一句話寫出你理解的問題。逐字稿有錯字時，寫出你推測的原意。
-【回答】一到三句，講者可以直接唸出來的話。問題是英文就用英文回答，否則用繁體中文。
-【依據】原文的出處：章節、表格或圖的編號，數字照原文寫，附上標準差。
-【翻到】可以翻到的投影片頁碼和標題，例如「第 38 頁 Sensitivity…」。沒有適合的頁就省略這一行。
-【注意】只在需要時寫：原文沒寫、原文自己前後矛盾、或這是推論而不是原文內容。
+只輸出下面三種之一：
+1. SKIP：最近的聽眾發言裡沒有新的問題（寒暄、「聽得到嗎」、「謝謝」、主持人串場、講者自己在說話、或問題已經回答過而且沒有追問）。只輸出這四個字母。
+2. WAIT：聽眾的問題看起來還沒說完（話講到一半、只有開場白「我想請問一下…」）。只輸出這四個字母。如果訊息裡註明「對方已經停下來了」，就不要再輸出 WAIT。
+3. 回答，格式如下：
+
+【問題】一句話寫出你理解的問題；逐字稿有錯字時寫出推測的原意。一次有好幾個問題就合成一句寫清楚。
+【口語稿】講者可以直接唸的回答，三到六句，像當面說話一樣自然，不要條列、不要 markdown。可以用一句很短的話開頭（例如「謝謝這個問題」），接著直接回答，關鍵數字照原文說。問題是英文就用英文，否則用繁體中文。原文沒寫的部分，在口語稿裡就老實說「論文沒有報告這一點」。
+【依據】原文出處：章節、表格或圖的編號，數字照原文寫，附標準差。
+【翻到】可以翻到的投影片頁碼和標題。沒有適合的頁就省略這一行。
+【注意】只在需要時寫：原文沒寫、原文前後矛盾、口語稿裡哪一句是推論。
 
 規則：
-- 只根據提供的論文原文和講者筆記回答。論文是唯一的權威來源；講者筆記裡標成 MY ANALYSIS、批判、推論的內容是講者自己的看法，引用時要說明是講者的分析。
-- 原文沒寫的事，直接說「原文沒寫」，不要編造數字、作者意圖或實驗。
-- 如果講者筆記裡已經整理過這題（例如 Q&A 預備、原文對不上的地方），優先沿用，但數字要以原文為準。
-- 不要寒暄，不要重複問題以外的鋪陳。"""
+- 只根據提供的論文原文和講者筆記回答。論文是唯一的權威來源；講者筆記裡標成 MY ANALYSIS、批判、推論的內容是講者自己的看法，用的時候要在【注意】說明。
+- 原文沒寫的事，直接說原文沒寫，不要編造數字、作者意圖或實驗。
+- 講者筆記裡已經整理過的題目（Q&A 預備、原文對不上的地方），優先沿用，但數字以原文為準。
+- 講者自己（「我」）已經回答了一部分時，口語稿要接著補充，不要重複他已經說過的。"""
 
 
 def _deck_map() -> str:
@@ -79,17 +85,22 @@ class Citation:
 class Answer:
     text: str
     citations: list[Citation]
-    skipped: bool
-    refused: bool
+    status: str  # "answer", "skip", "wait" or "refused"
+
+    @property
+    def question(self) -> str:
+        m = re.search(r"【問題】(.+)", self.text)
+        return m.group(1).strip() if m else ""
 
 
-def _question_block(question: str, history: list[tuple[str, str]]) -> dict:
+def _request_block(transcript: list[str], answered: list[str], note: str = "") -> dict:
     parts = []
-    if history:
-        recent = "\n\n".join(f"問：{q}\n答：{a}" for q, a in history[-3:])
-        parts.append(f"（先前的問答，供追問時參考）\n{recent}\n")
-    parts.append(f"逐字稿：{question}")
-    return {"type": "text", "text": "\n".join(parts)}
+    if answered:
+        parts.append("已經回答過的問題：\n" + "\n".join(f"- {q}" for q in answered[-8:]))
+    parts.append("最近的逐字稿（由舊到新）：\n" + "\n".join(transcript))
+    if note:
+        parts.append(note)
+    return {"type": "text", "text": "\n\n".join(parts)}
 
 
 def _citations(message) -> list[Citation]:
@@ -126,17 +137,18 @@ class Answerer:
         response = await self.client.beta.messages.create(**self._params(self.context, 0))
         return response.usage.cache_creation_input_tokens + response.usage.cache_read_input_tokens
 
-    async def stream(self, question: str, history: list[tuple[str, str]]) -> AsyncIterator[str | Answer]:
+    async def stream(
+        self, transcript: list[str], answered: list[str], note: str = ""
+    ) -> AsyncIterator[str | Answer]:
         """Yield text deltas, then one final Answer."""
-        content = [*self.context, _question_block(question, history)]
+        content = [*self.context, _request_block(transcript, answered, note)]
         async with self.client.beta.messages.stream(**self._params(content, MAX_TOKENS)) as stream:
             async for text in stream.text_stream:
                 yield text
             message = await stream.get_final_message()
         text = "".join(b.text for b in message.content if b.type == "text").strip()
-        yield Answer(
-            text=text,
-            citations=_citations(message),
-            skipped=text == SKIP,
-            refused=message.stop_reason == "refusal",
-        )
+        if message.stop_reason == "refusal":
+            status = "refused"
+        else:
+            status = {SKIP: "skip", WAIT: "wait"}.get(text, "answer")
+        yield Answer(text=text, citations=_citations(message), status=status)

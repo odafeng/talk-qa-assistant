@@ -1,4 +1,4 @@
-"""Local web app: Meet tab audio -> Gemini Live transcript -> Claude answers, shown in the browser.
+"""Local web app: Meet tab + mic audio -> Gemini Live transcript -> Claude spoken answers, in the browser.
 
 Run from this folder:  uv run uvicorn app:app --port 8777
 """
@@ -7,13 +7,14 @@ import asyncio
 import contextlib
 import json
 import logging
+import re
 import time
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
 
 import anthropic
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
@@ -25,6 +26,15 @@ from transcriber import Transcriber
 HERE = Path(__file__).resolve().parent
 SESSIONS = HERE / "sessions"
 REWARM_SECONDS = 50 * 60  # under the 1-hour cache TTL
+PORT = 8777
+# Only this page may open the socket; any other site could otherwise read the transcript or spend API credit.
+ALLOWED_ORIGINS = {f"http://localhost:{PORT}", f"http://127.0.0.1:{PORT}"}
+AUDIENCE, ME = "聽眾", "我"
+CHANNELS = {0: AUDIENCE, 1: ME}  # first byte of each binary audio frame
+WINDOW_LINES = 40  # transcript lines sent with each request
+WAIT_FORCE_SECONDS = 6.0  # after a WAIT, answer anyway once the audience has been quiet this long
+FORCE_NOTE = "對方已經停下來了，請直接處理，不要再輸出 WAIT。"
+NOW_NOTE = "講者按了「現在回答」：請回答最近一個聽眾問題，不要輸出 SKIP 或 WAIT。"
 
 log = logging.getLogger("qa")
 state: dict = {"answerer": None, "warm_tokens": 0, "last_call": 0.0, "warm_error": ""}
@@ -77,15 +87,28 @@ async def health() -> dict:
     }
 
 
+@app.get("/download/{name}")
+async def download(name: str) -> FileResponse:
+    if not re.fullmatch(r"\d{8}_\d{6}_(transcript\.txt|qa\.jsonl)", name) or not (SESSIONS / name).exists():
+        raise HTTPException(404)
+    return FileResponse(SESSIONS / name, filename=name)
+
+
 @app.websocket("/ws")
 async def ws_endpoint(ws: WebSocket) -> None:
+    if ws.headers.get("origin") not in ALLOWED_ORIGINS:
+        await ws.close(code=1008)
+        return
     await ws.accept()
-    log_path = SESSIONS / f"{datetime.now():%Y%m%d_%H%M%S}.jsonl"
-    send_lock = asyncio.Lock()
-    history: list[tuple[str, str]] = []
-    segments: dict[int, str] = {}
+    stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+    transcript_path, qa_path = SESSIONS / f"{stamp}_transcript.txt", SESSIONS / f"{stamp}_qa.jsonl"
+    started = time.monotonic()
+    send_lock, evaluating = asyncio.Lock(), asyncio.Lock()
+    lines: list[str] = []
+    answered: list[str] = []
+    queues: dict[int, asyncio.Queue] = {}
     tasks: set[asyncio.Task] = set()
-    session = {"audio": None, "auto": True, "next_id": 1}
+    flags = {"auto": True, "rerun": "", "waiting": False, "next_id": 1}
     segmenter = Segmenter()
 
     async def send(event: dict) -> None:
@@ -93,75 +116,110 @@ async def ws_endpoint(ws: WebSocket) -> None:
             async with send_lock:
                 await ws.send_text(json.dumps(event, ensure_ascii=False))
 
-    def record(event: dict) -> None:
-        with log_path.open("a", encoding="utf-8") as f:
-            f.write(
-                json.dumps({"t": datetime.now().isoformat(timespec="seconds"), **event}, ensure_ascii=False)
-                + "\n"
-            )
-
     def spawn(coro) -> None:
         task = asyncio.create_task(coro)
         tasks.add(task)
         task.add_done_callback(tasks.discard)
 
-    async def answer(question: str, source: str) -> None:
+    async def run_once(note: str) -> None:
         answerer: Answerer | None = state["answerer"]
-        aid = session["next_id"]
-        session["next_id"] += 1
         if answerer is None:
             await send(
                 {"type": "error", "text": "沒有 Claude API key：請填 tools/qa_assistant/.env 後重開。"}
             )
             return
-        await send({"type": "answer_start", "id": aid, "question": question, "source": source})
+        if not lines and not note:
+            return
+        aid = flags["next_id"]
+        flags["next_id"] += 1
+        await send({"type": "answer_start", "id": aid})
         state["last_call"] = time.monotonic()
         try:
-            async for piece in answerer.stream(question, history):
-                if isinstance(piece, Answer):
-                    if not piece.skipped and not piece.refused:
-                        history.append((question, piece.text))
-                    record({"question": question, "source": source, **asdict(piece)})
-                    await send({"type": "answer_done", "id": aid, **asdict(piece)})
-                else:
+            async for piece in answerer.stream(lines[-WINDOW_LINES:], answered, note):
+                if not isinstance(piece, Answer):
                     await send({"type": "answer_delta", "id": aid, "text": piece})
+                    continue
+                if piece.status == "answer":
+                    answered.append(piece.question or "（未擷取到問題）")
+                flags["waiting"] = piece.status == "wait"
+                with qa_path.open("a", encoding="utf-8") as f:
+                    f.write(
+                        json.dumps(
+                            {
+                                "t": datetime.now().isoformat(timespec="seconds"),
+                                "note": note,
+                                **asdict(piece),
+                            },
+                            ensure_ascii=False,
+                        )
+                        + "\n"
+                    )
+                await send({"type": "answer_done", "id": aid, **asdict(piece)})
         except anthropic.APIError as e:
             await send({"type": "answer_error", "id": aid, "text": f"{type(e).__name__}: {e}"})
 
-    async def emit_segment(text: str) -> None:
-        sid = len(segments) + 1
-        segments[sid] = text
-        record({"segment": text})
-        await send({"type": "segment", "id": sid, "text": text})
-        if session["auto"]:
-            spawn(answer(text, "auto"))
+    async def evaluate(note: str = "") -> None:
+        """One request at a time, so a question is never answered twice in parallel."""
+        if evaluating.locked():
+            flags["rerun"] = note or flags["rerun"] or " "
+            return
+        async with evaluating:
+            await send({"type": "thinking", "on": True})
+            while True:
+                await run_once(note.strip())
+                note, flags["rerun"] = flags["rerun"], ""
+                if not note:
+                    break
+            await send({"type": "thinking", "on": False})
 
-    async def on_final(text: str) -> None:
-        await send({"type": "final", "text": text})
-        if done := segmenter.add_final(text, time.monotonic()):
-            await emit_segment(done)
+    async def on_audience_pause() -> None:
+        if flags["auto"]:
+            await evaluate()
+
+    async def add_line(speaker: str, text: str) -> None:
+        mins, secs = divmod(int(time.monotonic() - started), 60)
+        line = f"[{mins:02d}:{secs:02d}] {speaker}：{text}"
+        lines.append(line)
+        with transcript_path.open("a", encoding="utf-8") as f:
+            f.write(line + "\n")
+        await send({"type": "final", "speaker": speaker, "line": line})
+        if speaker == AUDIENCE and segmenter.add_final(text, time.monotonic()):
+            spawn(on_audience_pause())
 
     async def ticker() -> None:
         while True:
             await asyncio.sleep(0.5)
-            if done := segmenter.tick(time.monotonic()):
-                await emit_segment(done)
+            now = time.monotonic()
+            if segmenter.tick(now):
+                spawn(on_audience_pause())
+            elif flags["waiting"] and now - segmenter.last_activity >= WAIT_FORCE_SECONDS:
+                flags["waiting"] = False
+                spawn(evaluate(FORCE_NOTE))
 
-    async def start_listening() -> None:
-        if session["audio"] is not None:
+    async def start_channel(channel: int) -> None:
+        if channel in queues or channel not in CHANNELS:
             return
         if not (key := config.gemini_key()):
             await send({"type": "error", "text": "找不到 GEMINI_API_KEY。"})
             return
-        session["audio"] = asyncio.Queue(maxsize=500)
-        transcriber = Transcriber(key, send, lambda: segmenter.add_interim(time.monotonic()), on_final)
-        spawn(transcriber.run(session["audio"]))
+        speaker = CHANNELS[channel]
+        queues[channel] = asyncio.Queue(maxsize=500)
 
-    async def stop_listening() -> None:
-        if (queue := session["audio"]) is not None:
-            session["audio"] = None
-            await queue.put(None)
-            await send({"type": "status", "text": "已停止聆聽"})
+        async def send_tagged(event: dict) -> None:
+            await send({**event, "speaker": speaker})
+
+        def on_interim() -> None:
+            if speaker == AUDIENCE:
+                segmenter.add_interim(time.monotonic())
+
+        async def on_final(text: str) -> None:
+            await add_line(speaker, text)
+
+        spawn(Transcriber(key, send_tagged, on_interim, on_final).run(queues[channel]))
+
+    async def stop_all() -> None:
+        for channel in list(queues):
+            await queues.pop(channel).put(None)
 
     spawn(ticker())
     await send(
@@ -171,6 +229,8 @@ async def ws_endpoint(ws: WebSocket) -> None:
             "gemini_key": bool(config.gemini_key()),
             "cache_tokens": state["warm_tokens"],
             "warm_error": state["warm_error"],
+            "transcript": transcript_path.name,
+            "qa": qa_path.name,
         }
     )
     try:
@@ -178,23 +238,25 @@ async def ws_endpoint(ws: WebSocket) -> None:
             message = await ws.receive()
             if message["type"] == "websocket.disconnect":
                 break
-            if (chunk := message.get("bytes")) is not None:
-                if (queue := session["audio"]) is not None and not queue.full():
-                    queue.put_nowait(chunk)
+            if (frame := message.get("bytes")) is not None:
+                if frame and (queue := queues.get(frame[0])) is not None and not queue.full():
+                    queue.put_nowait(frame[1:])
                 continue
             event = json.loads(message.get("text") or "{}")
             kind = event.get("type")
             if kind == "start":
-                await start_listening()
+                await start_channel(int(event.get("channel", 0)))
             elif kind == "stop":
-                await stop_listening()
+                await stop_all()
+                await send({"type": "status", "text": "已停止聆聽"})
             elif kind == "auto":
-                session["auto"] = bool(event.get("on"))
+                flags["auto"] = bool(event.get("on"))
+            elif kind == "answer_now":
+                spawn(evaluate(NOW_NOTE))
             elif kind == "ask" and (text := str(event.get("text", "")).strip()):
-                spawn(answer(text, "manual"))
-            elif kind == "answer_segment" and (text := segments.get(int(event.get("id", 0)))):
-                spawn(answer(text, "segment"))
+                await add_line("我（手動輸入的問題）", text)
+                spawn(evaluate(f"講者手動輸入了這個問題，請直接回答，不要輸出 SKIP 或 WAIT：{text}"))
     finally:
-        await stop_listening()
+        await stop_all()
         for task in list(tasks):
             task.cancel()

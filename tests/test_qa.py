@@ -1,5 +1,8 @@
 from types import SimpleNamespace
 
+import pytest
+from starlette.websockets import WebSocketDisconnect
+
 from fastapi.testclient import TestClient
 
 import answerer
@@ -51,11 +54,17 @@ def test_context_caches_the_notes_after_the_pdf():
     assert "Q&A 預備" in notes["text"] and "第 44 頁" in notes["text"]
 
 
-def test_question_block_keeps_only_three_recent_answers():
-    history = [(f"q{i}", f"a{i}") for i in range(5)]
-    text = answerer._question_block("新問題", history)["text"]
-    assert "q1" not in text and "q2" in text and "q4" in text
-    assert text.endswith("逐字稿：新問題")
+def test_request_block_lists_answered_questions_then_the_transcript():
+    answered = [f"q{i}" for i in range(10)]
+    text = answerer._request_block(["[00:01] 聽眾：請問 flow 呢"], answered, "NOTE")["text"]
+    assert "- q1\n" not in text and "- q2" in text and "- q9" in text
+    assert text.index("已經回答過") < text.index("最近的逐字稿") < text.index("NOTE")
+
+
+def test_answer_status_and_question_extraction():
+    a = answerer.Answer(text="【問題】flow 只在訓練用嗎？\n【口語稿】是的。", citations=[], status="answer")
+    assert a.question == "flow 只在訓練用嗎？"
+    assert answerer.Answer(text="SKIP", citations=[], status="skip").question == ""
 
 
 def test_citations_are_deduplicated_and_keep_page_numbers():
@@ -69,13 +78,78 @@ def test_citations_are_deduplicated_and_keep_page_numbers():
     assert answerer._citations(message) == [answerer.Citation(page=7, text="flow is used only in training")]
 
 
+ORIGIN = {"origin": "http://localhost:8777"}
+
+
+@pytest.fixture(autouse=True)
+def sessions_in_tmp(monkeypatch, tmp_path):
+    monkeypatch.setattr(app_module, "SESSIONS", tmp_path)
+
+
 def test_server_starts_and_reports_missing_claude_key(monkeypatch):
     monkeypatch.setattr(config, "anthropic_key", lambda: "")
     with TestClient(app_module.app) as client:
         assert client.get("/health").json()["anthropic_key"] is False
         assert "Q&amp;A 助手" in client.get("/").text
-        with client.websocket_connect("/ws") as ws:
+        with client.websocket_connect("/ws", headers=ORIGIN) as ws:
             hello = ws.receive_json()
             assert hello["type"] == "hello" and hello["anthropic_key"] is False
             ws.send_json({"type": "ask", "text": "flow 只在訓練時用嗎"})
+            assert ws.receive_json()["type"] == "final"
+            assert ws.receive_json()["type"] == "thinking"
             assert ws.receive_json()["type"] == "error"
+
+
+def test_websocket_rejects_other_origins(monkeypatch):
+    monkeypatch.setattr(config, "anthropic_key", lambda: "")
+    with TestClient(app_module.app) as client:
+        with pytest.raises(WebSocketDisconnect):
+            with client.websocket_connect("/ws", headers={"origin": "https://evil.example"}) as ws:
+                ws.receive_json()
+
+
+def test_download_only_serves_session_files(monkeypatch):
+    monkeypatch.setattr(config, "anthropic_key", lambda: "")
+    with TestClient(app_module.app) as client:
+        assert client.get("/download/..%2Fconfig.py").status_code == 404
+        assert client.get("/download/20260101_000000_transcript.txt").status_code == 404
+
+
+class FakeAnswerer:
+    def __init__(self):
+        self.calls = []
+
+    async def stream(self, transcript, answered, note=""):
+        self.calls.append((list(transcript), list(answered), note))
+        yield "【問題】flow 只在訓練用嗎？"
+        yield "\n【口語稿】是的，只在訓練時用。"
+        yield answerer.Answer(
+            text="【問題】flow 只在訓練用嗎？\n【口語稿】是的，只在訓練時用。",
+            citations=[answerer.Citation(page=4, text="flow")],
+            status="answer",
+        )
+
+
+def test_manual_question_streams_a_spoken_answer(monkeypatch):
+    monkeypatch.setattr(config, "anthropic_key", lambda: "")
+    fake = FakeAnswerer()
+    with TestClient(app_module.app) as client:
+        monkeypatch.setitem(app_module.state, "answerer", fake)
+        with client.websocket_connect("/ws", headers=ORIGIN) as ws:
+            ws.receive_json()  # hello
+            ws.send_json({"type": "ask", "text": "flow 只在訓練時用嗎"})
+            events = [ws.receive_json() for _ in range(7)]
+    kinds = [e["type"] for e in events]
+    assert kinds == [
+        "final",
+        "thinking",
+        "answer_start",
+        "answer_delta",
+        "answer_delta",
+        "answer_done",
+        "thinking",
+    ]
+    assert events[5]["status"] == "answer" and events[5]["citations"][0]["page"] == 4
+    transcript, answered, note = fake.calls[0]
+    assert transcript[-1].endswith("我（手動輸入的問題）：flow 只在訓練時用嗎") and answered == []
+    assert "不要輸出 SKIP 或 WAIT" in note

@@ -10,25 +10,28 @@
 <header>
   <h1>SurgiFlowVid Q&amp;A 助手</h1>
   <span id="status" class="pill">連線中…</span>
+  <span id="thinking" class="pill think" hidden>判斷中…</span>
   <div class="controls">
-    <button id="btnTab" class="primary">聆聽 Meet 分頁</button>
-    <button id="btnMic">改用麥克風</button>
+    <button id="btnStart" class="primary">開始聆聽</button>
     <button id="btnStop" disabled>停止</button>
-    <label class="toggle"><input type="checkbox" id="auto" checked> 自動回答</label>
-    <meter id="level" min="0" max="100" value="0" title="收音音量"></meter>
+    <label class="toggle"><input type="checkbox" id="withMic" checked> 也收我的麥克風</label>
+    <label class="toggle"><input type="checkbox" id="auto" checked> 自動擷取問題</label>
+    <button id="btnNow" title="不等停頓，立刻回答最近的聽眾問題">現在回答</button>
+    <meter id="levelTab" min="0" max="100" value="0" title="Meet 分頁音量"></meter>
+    <meter id="levelMic" min="0" max="100" value="0" title="麥克風音量"></meter>
   </div>
 </header>
 <div id="warn" class="warn" hidden></div>
 <main>
   <section class="transcript">
-    <h2>逐字稿（其他人的聲音）</h2>
-    <div id="segments"></div>
-    <div id="pending" class="pending"></div>
-    <div id="interim" class="interim"></div>
+    <h2>逐字稿 <a id="dlTranscript" href="#" hidden>下載</a></h2>
+    <div id="lines"></div>
+    <div id="interim-聽眾" class="interim aud"></div>
+    <div id="interim-我" class="interim me"></div>
   </section>
   <section class="answers">
-    <h2>回答</h2>
-    <div id="answers"></div>
+    <h2>口語稿 <a id="dlQa" href="#" hidden>下載問答紀錄</a></h2>
+    <div id="answers"><p class="empty">聽到聽眾提問後，口語稿會出現在這裡。</p></div>
   </section>
 </main>
 <form id="askForm">

@@ -16,28 +16,29 @@ button { font: inherit; font-size: 14px; padding: 6px 12px; border-radius: 6px; 
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button:disabled { opacity: .45; cursor: default; }
 .toggle { font-size: 14px; color: var(--muted); }
-meter { width: 90px; }
+meter { width: 70px; }
 .warn { background: #fde8e8; color: var(--bad); padding: 8px 18px; font-size: 15px; }
 main { flex: 1; display: grid; grid-template-columns: minmax(260px, 1fr) 2.2fr; gap: 14px; padding: 14px 18px;
   min-height: 0; }
 section { overflow-y: auto; min-height: 0; }
-.seg { background: var(--card); border: 1px solid var(--rule); border-radius: 8px; padding: 8px 10px;
-  margin-bottom: 8px; font-size: 15px; }
-.seg button { font-size: 12px; padding: 2px 8px; margin-top: 4px; }
-.pending { font-size: 15px; }
+.line { font-size: 15px; padding: 3px 0; border-bottom: 1px solid #eeebe3; }
+.line.aud { color: var(--ink); }
+.line.me { color: var(--muted); }
 .interim { color: var(--muted); font-size: 15px; font-style: italic; }
+.interim:empty { display: none; }
+.pill.think { background: #fff4d6; color: #8a5a00; }
+.empty { color: var(--muted); }
+h2 a { font-size: 12px; margin-left: 8px; letter-spacing: 0; text-transform: none; }
 .card { background: var(--card); border: 1px solid var(--rule); border-radius: 10px; padding: 12px 16px;
   margin-bottom: 12px; }
 .card.newest { border-color: var(--accent); box-shadow: 0 0 0 2px #2b6cb022; }
-.card .q { color: var(--muted); font-size: 14px; margin-bottom: 6px; }
 .card .body { white-space: pre-wrap; }
-.card .sec { display: block; margin-top: 6px; }
-.card .sec.answer { font-size: 21px; font-weight: 700; background: var(--hl); padding: 6px 10px; border-radius: 6px; }
+.card .sec { margin-top: 6px; }
+.card .sec.question { font-size: 15px; color: var(--muted); }
+.card .sec.speech { font-size: 22px; line-height: 1.7; background: var(--hl); padding: 8px 12px; border-radius: 6px; }
 .card .label { color: var(--accent); font-weight: 700; margin-right: 4px; font-size: 14px; }
-.card.skipped { opacity: .55; padding: 6px 12px; font-size: 14px; }
-.card.skipped .body { display: none; }
 .cites { margin-top: 8px; font-size: 13px; color: var(--muted); border-top: 1px dashed var(--rule); padding-top: 6px; }
 .cites div { margin-top: 2px; }
-.meta { font-size: 12px; color: var(--muted); float: right; }
+.meta { font-size: 12px; color: var(--muted); text-align: right; }
 form { display: flex; gap: 8px; padding: 10px 18px; background: var(--card); border-top: 1px solid var(--rule); }
 form input { flex: 1; font: inherit; padding: 8px 12px; border: 1px solid var(--rule); border-radius: 6px; }
