@@ -109,6 +109,8 @@ async def ws_endpoint(ws: WebSocket) -> None:
     queues: dict[int, asyncio.Queue] = {}
     tasks: set[asyncio.Task] = set()
     flags = {"auto": True, "rerun": "", "waiting": False, "next_id": 1}
+    # The evaluation in flight; it can be restarted until its answer starts showing on screen.
+    current: dict = {"task": None, "note": "", "visible": False}
     segmenter = Segmenter()
 
     async def send(event: dict) -> None:
@@ -134,9 +136,12 @@ async def ws_endpoint(ws: WebSocket) -> None:
         flags["next_id"] += 1
         await send({"type": "answer_start", "id": aid})
         state["last_call"] = time.monotonic()
+        shown = ""
         try:
             async for piece in answerer.stream(lines[-WINDOW_LINES:], answered, note):
                 if not isinstance(piece, Answer):
+                    shown += piece
+                    current["visible"] = shown.lstrip().startswith("【")
                     await send({"type": "answer_delta", "id": aid, "text": piece})
                     continue
                 if piece.status == "answer":
@@ -166,11 +171,30 @@ async def ws_endpoint(ws: WebSocket) -> None:
         async with evaluating:
             await send({"type": "thinking", "on": True})
             while True:
-                await run_once(note.strip())
+                current.update(note=note.strip(), visible=False)
+                current["task"] = task = asyncio.create_task(run_once(note.strip()))
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    if asyncio.current_task().cancelling():
+                        raise
                 note, flags["rerun"] = flags["rerun"], ""
                 if not note:
                     break
+            current["task"] = None
             await send({"type": "thinking", "on": False})
+
+    def audience_still_talking() -> None:
+        """New audience speech makes an unseen verdict stale: drop it and judge again at the next pause.
+
+        A question asked in fragments then never gets answered from its first half. A forced
+        request (typed question, 現在回答) is re-run at once instead of waiting for a pause.
+        """
+        task = current["task"]
+        if task is not None and not task.done() and not current["visible"]:
+            flags["rerun"] = current["note"] or flags["rerun"]
+            flags["waiting"] = False
+            task.cancel()
 
     async def on_audience_pause() -> None:
         if flags["auto"]:
@@ -211,6 +235,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
         def on_interim() -> None:
             if speaker == AUDIENCE:
                 segmenter.add_interim(time.monotonic())
+                audience_still_talking()
 
         async def on_final(text: str) -> None:
             await add_line(speaker, text)
