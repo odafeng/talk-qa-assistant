@@ -21,7 +21,8 @@ def _gate_returning(result):
     async def system_one(state, questions):
         if isinstance(result, Exception):
             raise result
-        return SimpleNamespace(answers={"verdict": result})
+        verdict, figure = result if isinstance(result, tuple) else (result, None)
+        return SimpleNamespace(answers={"verdict": verdict, **({"figure": figure} if figure else {})})
 
     g.client = SimpleNamespace(system_one=system_one)  # type: ignore[assignment]
     return g
@@ -41,3 +42,13 @@ def test_judge_returns_none_when_jev_fails_or_answers_oddly():
 
 def test_every_jev_option_has_a_status():
     assert set(gate.VERDICT.criteria) == set(gate.STATUS)
+
+
+def test_judge_reports_whether_the_question_needs_a_figure():
+    verdict = ChoiceAnswer(choice="new_question", confidence=0.95, probabilities={"new_question": 0.95})
+    figure = ChoiceAnswer(choice="needs_figure", confidence=1.0, probabilities={"needs_figure": 1.0})
+    judged = asyncio.run(_gate_returning((verdict, figure)).judge("那個失敗的例子長怎樣"))
+    assert judged is not None and judged.needs_figure
+    no_figure = asyncio.run(_gate_returning(verdict).judge("x"))  # a missing answer means no figure
+    assert no_figure is not None and not no_figure.needs_figure
+    assert set(gate.FIGURE.criteria) == {"needs_figure", "text_enough"}

@@ -199,10 +199,12 @@ async def ws_endpoint(ws: WebSocket) -> None:
         # Jev answers "does this need a reply?" in about 0.2 s. A confident no or not-yet ends the
         # turn without Claude; a confident yes lets Claude skip its own judgment; anything else
         # (low confidence, Jev down, or a forced request) is judged by Claude as before.
+        # Typed and forced requests skip the routing but still get Jev's "needs a figure?" answer.
         verdict = None
         gate: Gate | None = state["gate"]
-        if gate is not None and not note:
-            verdict = await gate.judge(_request_block(seen, new, answered)["text"])
+        if gate is not None:
+            verdict = await gate.judge(_request_block(seen, new, answered, note)["text"])
+        if verdict is not None and not note:
             action = route(verdict)
             if action in ("skip", "wait"):
                 flags["waiting"] = action == "wait"
@@ -219,7 +221,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
         state["last_call"] = time.monotonic()
         shown = ""
         try:
-            with_images = needs_images([*new, note])
+            with_images = needs_images([*new, note]) or (verdict is not None and verdict.needs_figure)
             async for piece in answerer.stream(seen, new, answered, note, with_images=with_images):
                 if not isinstance(piece, Answer):
                     shown += piece

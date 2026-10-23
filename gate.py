@@ -1,4 +1,4 @@
-"""Fast first pass with Jev: does the new transcript need an answer? Claude is asked only when it might.
+"""Fast first pass with Jev: does the new transcript need an answer, and does it need the figures?
 
 Replayed on the first real Q&A (2026-10-23, 53 audience lines), Jev took 0.2 s per verdict against
 Claude's 2 s, and its verdicts at confidence >= 0.8 (31 of 53) matched Claude's in 30 cases; the one
@@ -30,12 +30,27 @@ VERDICT = Choice(
 )
 STATUS = {"new_question": "answer", "unfinished": "wait", "no_answer": "skip"}
 
+# Asked in the same call, so it costs no extra time. On 18 labelled questions it was right 17 times,
+# against 13 for the keyword rule (answerer.needs_images), which misses "what did that failed
+# example look like?"; the app sends images when either says so (ADR 0005).
+FIGURE = Choice(
+    instructions=(
+        "只看「新逐字稿」裡的問題（聽眾問的，或講者手動輸入的）：要回答它，需不需要看論文裡的圖"
+        "（例如架構圖、長條圖、生成影片的畫面、失敗案例的截圖），還是論文文字和表格的數字就夠了？"
+    ),
+    criteria={
+        "needs_figure": "需要看圖：問題在問圖裡畫了什麼、某個例子或畫面長什麼樣子、看起來怎樣、只畫在圖上的數值或位置。",
+        "text_enough": "不需要看圖：問的是方法、理由、設定、表格裡的數字、限制或一般看法，論文文字就能回答。",
+    },
+)
+
 
 @dataclass(frozen=True)
 class Verdict:
     status: str  # "answer", "wait" or "skip"
     confidence: float
     seconds: float
+    needs_figure: bool = False
 
     @property
     def confident(self) -> bool:
@@ -58,10 +73,12 @@ class Gate:
         """Jev's verdict on the request text, or None if Jev is unavailable (Claude then decides)."""
         started = time.monotonic()
         try:
-            response = await self.client.system_one(state, {"verdict": VERDICT})
+            response = await self.client.system_one(state, {"verdict": VERDICT, "figure": FIGURE})
         except TypeSafeError:
             return None
         answer = response.answers.get("verdict")
         if not isinstance(answer, ChoiceAnswer) or answer.choice not in STATUS:
             return None
-        return Verdict(STATUS[answer.choice], answer.confidence, time.monotonic() - started)
+        figure = response.answers.get("figure")
+        needs_figure = isinstance(figure, ChoiceAnswer) and figure.choice == "needs_figure"
+        return Verdict(STATUS[answer.choice], answer.confidence, time.monotonic() - started, needs_figure)
