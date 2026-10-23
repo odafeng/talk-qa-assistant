@@ -1,6 +1,6 @@
 """Stream 16 kHz PCM audio to Gemini Live and report interim and final transcripts.
 
-Ported from ~/Desktop/Projects/lecture_live_notes/app.py (gemini_asr_worker), minus file saving.
+Ported from the lecture_live_notes project (gemini_asr_worker), minus file saving.
 """
 
 import asyncio
@@ -23,42 +23,8 @@ ROTATE_SECONDS = 570
 # Pings queue behind audio frames; a short deadline closed healthy sessions in lecture_live_notes.
 PING_INTERVAL, PING_TIMEOUT = 30, 60
 MAX_FAILURES = 5
-VOCABULARY = [
-    "SurgiFlowVid",
-    "SurV-Gen",
-    "SparseCtrl",
-    "Endora",
-    "SurgSora",
-    "Bora",
-    "SAR-RARP50",
-    "GraSP",
-    "AutoLaparo",
-    "GynSurg",
-    "optical flow",
-    "RAFT",
-    "UniMatch",
-    "diffusion",
-    "U-Net",
-    "latent",
-    "Stable Diffusion",
-    "dual-prediction",
-    "sparse visual encoder",
-    "SVE",
-    "Jaccard",
-    "mAP",
-    "Dice",
-    "F1",
-    "MViT",
-    "TAPIS",
-    "X3D",
-    "rejection sampling",
-    "under-represented",
-    "data imbalance",
-    "lambda p",
-    "segmentation mask",
-    "temporal attention",
-    "ICML",
-]
+# Terms that help any talk; each talk adds its own in talk.toml (vocabulary = [...]).
+BASE_VOCABULARY = ("diffusion", "U-Net", "latent", "optical flow", "segmentation", "ablation", "baseline")
 
 # s2twp also maps mainland wording (視頻 -> 影片), which Gemini sometimes emits.
 TRADITIONAL = OpenCC("s2twp")
@@ -73,11 +39,14 @@ class Transcriber:
     def __init__(
         self,
         api_key: str,
+        vocabulary: tuple[str, ...],
         send: Send,
         on_interim: Callable[[], None],
         on_final: Callable[[str], Awaitable[None]],
     ) -> None:
         self.api_key, self.send = api_key, send
+        # Gemini accepts up to 100 custom terms.
+        self.vocabulary = list(dict.fromkeys((*vocabulary, *BASE_VOCABULARY)))[:100]
         self.on_interim, self.on_final = on_interim, on_final
 
     async def _receive(self, ws) -> None:
@@ -110,7 +79,7 @@ class Transcriber:
                         "generationConfig": {"responseModalities": ["TEXT"]},
                         "inputAudioTranscription": {
                             "languageCodes": [],
-                            "customVocabulary": VOCABULARY,
+                            "customVocabulary": self.vocabulary,
                             "mode": "SMART",
                         },
                     }

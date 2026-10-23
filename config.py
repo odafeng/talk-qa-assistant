@@ -5,20 +5,18 @@ from pathlib import Path
 
 from dotenv import dotenv_values
 
-HERE = Path(__file__).resolve().parent
-LECTURE_ENV = Path.home() / "Desktop/Projects/lecture_live_notes/.env"
+ENV_FILE = Path(__file__).resolve().parent / ".env"
 
 
-def _key(name: str, *env_files: Path) -> str:
-    for path in env_files:
-        if path.exists() and (value := (dotenv_values(path).get(name) or "").strip()):
-            return value
+def _key(name: str) -> str:
+    if ENV_FILE.exists() and (value := (dotenv_values(ENV_FILE).get(name) or "").strip()):
+        return value
     return os.getenv(name, "").strip()
 
 
 def anthropic_key() -> str:
-    return _key("ANTHROPIC_API_KEY", HERE / ".env")
+    return _key("ANTHROPIC_API_KEY")
 
 
 def gemini_key() -> str:
-    return _key("GEMINI_API_KEY", HERE / ".env", LECTURE_ENV)
+    return _key("GEMINI_API_KEY")

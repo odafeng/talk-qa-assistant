@@ -1,25 +1,16 @@
-"""Answer audience questions about SurgiFlowVid with Claude, grounded in the paper and talk notes."""
+"""Answer audience questions with Claude, grounded in the talk's paper and the speaker's notes."""
 
 import re
-import subprocess
-import sys
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
-from pathlib import Path
 
 import anthropic
 
-ROOT = Path(__file__).resolve().parents[2]
-sys.path.insert(0, str(ROOT / "tools"))
-from sync_notes import page_titles  # noqa: E402
-
-PAPER = ROOT / "SurgiFlowVid_ICML2026.pdf"
-SCRIPT = ROOT / "SurgiFlowVid_speaker_script.md"
-OUTLINE = ROOT / "SurgiFlowVid_seminar_outline.md"
-DECK = ROOT / "deck/slides/surgiflowvid-seminar/index.tsx"
+from slides import deck_map
+from talk import Talk, paper_pages
 
 # Measured 2026-10-23 on the same question: Opus 5.5 13.6 s, Sonnet 5.5 with thinking and the PDF
-# 10-15 s, Sonnet 5.5 without thinking and the paper as page text 5.9 s (first text 1.9 s).
+# 10-15 s, Sonnet 5.5 without thinking and the paper as page text 5.9 s (first text 1.9 s). ADR 0002.
 MODEL = "claude-sonnet-5-5"
 EFFORT = "low"
 THINKING = {"type": "between_tools"}  # Sonnet 5.5's way to turn thinking off
@@ -28,7 +19,7 @@ BETAS = ["server-side-fallback-2026-07-01"]
 SKIP = "SKIP"
 WAIT = "WAIT"
 
-SYSTEM = """你是講者的即時 Q&A 助手。講者黃士峰（大腸直腸外科醫師、博士生）正在 IIR seminar 線上報告 SurgiFlowVid（Venkatesh et al., ICML 2026），現在是提問時間。
+SYSTEM_TEMPLATE = """你是講者的即時 Q&A 助手。講者{speaker}正在{venue}線上報告{title}，現在是提問時間。
 
 你會收到會議的自動逐字稿（可能有辨識錯字）。每一行標了說話的人：「聽眾」是 Meet 裡其他人的聲音（提問者、主持人），「我」是講者自己的麥克風。逐字稿沒有區分不同的聽眾，同一個聽眾的問題也可能被停頓切成好幾行。
 
@@ -48,51 +39,43 @@ SYSTEM = """你是講者的即時 Q&A 助手。講者黃士峰（大腸直腸外
 規則：
 - 只根據提供的論文原文和講者筆記回答。論文是唯一的權威來源；講者筆記裡標成 MY ANALYSIS、批判、推論的內容是講者自己的看法，用的時候要在【注意】說明。
 - 原文沒寫的事，直接說原文沒寫，不要編造數字、作者意圖或實驗。
-- 講者筆記裡已經整理過的題目（Q&A 預備、原文對不上的地方），優先沿用，但數字以原文為準。
+- 講者筆記裡已經整理過的題目（例如 Q&A 預備、原文對不上的地方），優先沿用，但數字以原文為準。
 - 講者自己（「我」）已經回答了一部分時，口語稿要接著補充，不要重複他已經說過的。
 - 聽眾問題常常斷斷續續、被停頓切成好幾行，要把同一個人連續的幾行合起來理解。如果聽眾是在補充或修正一個已經回答過的問題，就重新給一份完整的回答，並在【問題】開頭寫「（更新）」。
 - 不要在回答最後另外列出原文句子，原文引句會由系統附在卡片下方。
 - 講者不是這篇論文的作者。口語稿提到論文的做法時要說「作者」或「論文」，不要說「我們」。"""
 
 
-def _deck_map() -> str:
-    titles = page_titles(DECK.read_text())
-    lines = [f"第 {n} 頁：{t}" + ("（Backup）" if n > 44 else "") for n, t in enumerate(titles, 1)]
-    return "\n".join(lines)
+def system_prompt(talk: Talk) -> str:
+    return SYSTEM_TEMPLATE.format(speaker=talk.speaker, venue=talk.venue, title=talk.title)
 
 
-def paper_pages() -> list[tuple[int, str]]:
-    """The paper as (page number, text) per non-empty page.
+def build_context(talk: Talk) -> tuple[list[dict], list[int]]:
+    """The cached prefix (paper pages + speaker materials) and the page number of each paper block.
 
-    Page text instead of the PDF halves the context (88k vs 173k tokens) and was much faster;
-    tables survive pdftotext -layout well enough that table numbers were still answered correctly.
+    The paper goes in as page text rather than the PDF: half the tokens (88k vs 173k on the
+    SurgiFlowVid talk) and much faster, while table numbers were still answered correctly.
     """
-    text = subprocess.run(
-        ["pdftotext", "-layout", str(PAPER), "-"], check=True, capture_output=True, text=True
-    )
-    return [(n, page) for n, page in enumerate(text.stdout.split("\f"), 1) if page.strip()]
-
-
-def build_context() -> tuple[list[dict], list[int]]:
-    """The cached prefix (paper pages + talk materials) and the page number of each paper block."""
-    pages = paper_pages()
-    notes = (
-        "以下是講者自己的材料，不是論文原文。\n\n"
-        f"## 投影片頁碼對照\n{_deck_map()}\n\n"
-        f"## 講稿\n{SCRIPT.read_text()}\n\n"
-        f"## 講者大綱與筆記（含 Q&A 預備和講者的分析）\n{OUTLINE.read_text()}"
-    )
+    pages = paper_pages(talk.paper)
+    sections = ["以下是講者自己的材料，不是論文原文。"]
+    if talk.slides:
+        sections.append(f"## 投影片頁碼對照\n{deck_map(talk.slides, talk.body_pages)}")
+    sections += [f"## {note.name}\n{note.read_text(encoding='utf-8')}" for note in talk.notes]
     paper = {
         "type": "document",
         "source": {
             "type": "content",
             "content": [{"type": "text", "text": f"[論文第 {n} 頁]\n{text}"} for n, text in pages],
         },
-        "title": "SurgiFlowVid (ICML 2026) 論文原文，逐頁文字",
+        "title": f"{talk.title} 論文原文，逐頁文字",
         "citations": {"enabled": True},
     }
-    notes_block = {"type": "text", "text": notes, "cache_control": {"type": "ephemeral", "ttl": "1h"}}
-    return [paper, notes_block], [n for n, _ in pages]
+    notes = {
+        "type": "text",
+        "text": "\n\n".join(sections),
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+    }
+    return [paper, notes], [n for n, _ in pages]
 
 
 @dataclass
@@ -138,15 +121,16 @@ def _citations(message, page_numbers: list[int]) -> list[Citation]:
 
 
 class Answerer:
-    def __init__(self, api_key: str) -> None:
+    def __init__(self, api_key: str, talk: Talk) -> None:
         self.client = anthropic.AsyncAnthropic(api_key=api_key)
-        self.context, self.page_numbers = build_context()
+        self.system = system_prompt(talk)
+        self.context, self.page_numbers = build_context(talk)
 
     def _params(self, content: list[dict], max_tokens: int) -> dict:
         return {
             "model": MODEL,
             "max_tokens": max_tokens,
-            "system": SYSTEM,
+            "system": self.system,
             "output_config": {"effort": EFFORT},
             "thinking": THINKING,
             "betas": BETAS,

@@ -1,8 +1,9 @@
 [project]
-name = "qa-assistant"
-version = "0.1.0"
-description = "Live Q&A helper for the SurgiFlowVid seminar: Meet audio -> Gemini Live transcript -> Claude answers"
-requires-python = ">=3.11"
+name = "talk-qa-assistant"
+version = "0.2.0"
+description = "Live Q&A helper for online talks: Meet tab audio -> Gemini Live transcript -> Claude spoken answers"
+readme = "README.md"
+requires-python = ">=3.12"
 dependencies = [
     "anthropic>=2.1",
     "fastapi>=0.115",
@@ -13,13 +14,27 @@ dependencies = [
 ]
 
 [dependency-groups]
-dev = ["pytest>=8", "httpx>=0.27"]
+dev = ["pytest>=8", "httpx>=0.27", "ruff>=0.6", "pyright>=1.1.380", "pre-commit>=3.8"]
 
 [tool.uv]
 package = false
 
 [tool.ruff]
 line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+
+[tool.ruff.lint.per-file-ignores]
+# The system prompt is prose; wrapping its lines would change what the model reads.
+"answerer.py" = ["E501"]
+
+[tool.pyright]
+include = ["*.py", "tests"]
+pythonVersion = "3.12"
+venvPath = "."
+venv = ".venv"
+typeCheckingMode = "standard"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

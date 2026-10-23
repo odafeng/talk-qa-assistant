@@ -1,14 +1,15 @@
 from types import SimpleNamespace
 
 import pytest
-from starlette.websockets import WebSocketDisconnect
-
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 import answerer
 import app as app_module
 import config
+import talk as talk_config
 from segmenter import Segmenter
+from slides import deck_map
 
 
 def test_utterance_ends_after_pause():
@@ -40,20 +41,35 @@ def test_long_monologue_is_cut_at_the_cap():
     assert s.add_final("六七八九十", now=0.5) == "一二三四五 六七八九十"
 
 
-def test_deck_map_lists_every_page_and_marks_backup():
-    lines = answerer._deck_map().splitlines()
-    assert len(lines) == 69
-    assert lines[0].startswith("第 1 頁：")
-    assert lines[44].endswith("（Backup）") and not lines[43].endswith("（Backup）")
+def test_talk_config_resolves_paths_next_to_the_file(talk_dir):
+    talk = talk_config.load(talk_dir / "talk.toml")
+    assert talk.speaker == "測試講者" and talk.paper == talk_dir / "paper.txt"
+    assert talk.notes == (talk_dir / "script.md", talk_dir / "outline.md")
+    assert talk.sessions == talk_dir / "sessions" and talk.vocabulary == ("TestPaper",)
 
 
-def test_context_sends_the_paper_as_page_text_and_caches_the_notes():
-    (paper, notes), pages = answerer.build_context()
+def test_paper_pages_keep_page_numbers_and_skip_blank_pages(talk_dir):
+    pages = talk_config.paper_pages(talk_dir / "paper.txt")
+    assert [n for n, _ in pages] == [1, 3]
+
+
+def test_deck_map_lists_every_page_and_marks_backup(talk_dir):
+    assert deck_map(talk_dir / "index.tsx", body_pages=2).splitlines() == [
+        "第 1 頁：Cover page",
+        "第 2 頁：Dual-prediction loss",
+        "第 3 頁：Extra（Backup）",
+    ]
+
+
+def test_context_sends_the_paper_as_page_text_and_caches_the_notes(talk_dir):
+    talk = talk_config.load(talk_dir / "talk.toml")
+    (paper, notes), pages = answerer.build_context(talk)
     blocks = paper["source"]["content"]
-    assert paper["citations"] == {"enabled": True} and len(blocks) == len(pages) >= 25
-    assert blocks[0]["text"].startswith(f"[論文第 {pages[0]} 頁]")
+    assert paper["citations"] == {"enabled": True} and pages == [1, 3]
+    assert blocks[1]["text"].startswith("[論文第 3 頁]")
     assert notes["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
-    assert "Q&A 預備" in notes["text"] and "第 44 頁" in notes["text"]
+    assert "Q&A 預備" in notes["text"] and "第 3 頁：Extra（Backup）" in notes["text"]
+    assert "測試講者" in answerer.system_prompt(talk) and "{speaker}" not in answerer.system_prompt(talk)
 
 
 def test_request_block_lists_answered_questions_then_the_transcript():
@@ -85,12 +101,7 @@ def test_citations_are_deduplicated_and_keep_page_numbers():
 ORIGIN = {"origin": "http://localhost:8777"}
 
 
-@pytest.fixture(autouse=True)
-def sessions_in_tmp(monkeypatch, tmp_path):
-    monkeypatch.setattr(app_module, "SESSIONS", tmp_path)
-
-
-def test_server_starts_and_reports_missing_claude_key(monkeypatch):
+def test_server_starts_and_reports_missing_claude_key(monkeypatch, talk_config):
     monkeypatch.setattr(config, "anthropic_key", lambda: "")
     with TestClient(app_module.app) as client:
         assert client.get("/health").json()["anthropic_key"] is False
@@ -98,13 +109,14 @@ def test_server_starts_and_reports_missing_claude_key(monkeypatch):
         with client.websocket_connect("/ws", headers=ORIGIN) as ws:
             hello = ws.receive_json()
             assert hello["type"] == "hello" and hello["anthropic_key"] is False
+            assert hello["title"] == "TestPaper（Doe et al., 2026）"
             ws.send_json({"type": "ask", "text": "flow 只在訓練時用嗎"})
             assert ws.receive_json()["type"] == "final"
             assert ws.receive_json()["type"] == "thinking"
             assert ws.receive_json()["type"] == "error"
 
 
-def test_websocket_rejects_other_origins(monkeypatch):
+def test_websocket_rejects_other_origins(monkeypatch, talk_config):
     monkeypatch.setattr(config, "anthropic_key", lambda: "")
     with TestClient(app_module.app) as client:
         with pytest.raises(WebSocketDisconnect):
@@ -112,7 +124,7 @@ def test_websocket_rejects_other_origins(monkeypatch):
                 ws.receive_json()
 
 
-def test_download_only_serves_session_files(monkeypatch):
+def test_download_only_serves_session_files(monkeypatch, talk_config):
     monkeypatch.setattr(config, "anthropic_key", lambda: "")
     with TestClient(app_module.app) as client:
         assert client.get("/download/..%2Fconfig.py").status_code == 404
@@ -134,7 +146,7 @@ class FakeAnswerer:
         )
 
 
-def test_manual_question_streams_a_spoken_answer(monkeypatch):
+def test_manual_question_streams_a_spoken_answer(monkeypatch, talk_config):
     monkeypatch.setattr(config, "anthropic_key", lambda: "")
     fake = FakeAnswerer()
     with TestClient(app_module.app) as client:

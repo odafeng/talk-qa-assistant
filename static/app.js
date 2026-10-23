@@ -45,8 +45,9 @@ function connect() {
 function handle(ev) {
   switch (ev.type) {
     case "hello": {
+      document.title = $("title").textContent = ev.title + " Q&A 助手";
       const problems = [];
-      if (!ev.anthropic_key) problems.push("沒有 Claude API key（填 tools/qa_assistant/.env 後重開），只會有逐字稿");
+      if (!ev.anthropic_key) problems.push("沒有 Claude API key（填 talk-qa-assistant/.env 後重開），只會有逐字稿");
       if (!ev.gemini_key) problems.push("沒有 Gemini API key");
       if (ev.warm_error) problems.push("Claude 預熱失敗：" + ev.warm_error);
       warn(problems.join("；"));

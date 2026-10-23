@@ -1,6 +1,6 @@
 """Local web app: Meet tab + mic audio -> Gemini Live transcript -> Claude spoken answers, in the browser.
 
-Run from this folder:  uv run uvicorn app:app --port 8777
+Run from this folder:  TALK_CONFIG=/path/to/talk.toml uv run uvicorn app:app --port 8777
 """
 
 import asyncio
@@ -19,12 +19,12 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 
 import config
+import talk as talk_config
 from answerer import Answer, Answerer
 from segmenter import Segmenter
 from transcriber import Transcriber
 
 HERE = Path(__file__).resolve().parent
-SESSIONS = HERE / "sessions"
 REWARM_SECONDS = 50 * 60  # under the 1-hour cache TTL
 PORT = 8777
 # Only this page may open the socket; any other site could otherwise read the transcript or spend API credit.
@@ -37,7 +37,7 @@ FORCE_NOTE = "對方已經停下來了，請直接處理，不要再輸出 WAIT�
 NOW_NOTE = "講者按了「現在回答」：請回答最近一個聽眾問題，不要輸出 SKIP 或 WAIT。"
 
 log = logging.getLogger("qa")
-state: dict = {"answerer": None, "warm_tokens": 0, "last_call": 0.0, "warm_error": ""}
+state: dict = {"talk": None, "answerer": None, "warm_tokens": 0, "last_call": 0.0, "warm_error": ""}
 
 
 async def _warm() -> None:
@@ -58,17 +58,18 @@ async def _keep_warm() -> None:
 
 @contextlib.asynccontextmanager
 async def lifespan(_: FastAPI):
-    SESSIONS.mkdir(exist_ok=True)
+    talk = state["talk"] = talk_config.load()
+    talk.sessions.mkdir(parents=True, exist_ok=True)
     background = []
     if key := config.anthropic_key():
-        state["answerer"] = Answerer(key)
+        state["answerer"] = Answerer(key, talk)
         background = [asyncio.create_task(_warm()), asyncio.create_task(_keep_warm())]
     yield
     for task in background:
         task.cancel()
 
 
-app = FastAPI(title="SurgiFlowVid Q&A assistant", lifespan=lifespan)
+app = FastAPI(title="Talk Q&A assistant", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
 
 
@@ -89,9 +90,10 @@ async def health() -> dict:
 
 @app.get("/download/{name}")
 async def download(name: str) -> FileResponse:
-    if not re.fullmatch(r"\d{8}_\d{6}_(transcript\.txt|qa\.jsonl)", name) or not (SESSIONS / name).exists():
+    sessions = state["talk"].sessions
+    if not re.fullmatch(r"\d{8}_\d{6}_(transcript\.txt|qa\.jsonl)", name) or not (sessions / name).exists():
         raise HTTPException(404)
-    return FileResponse(SESSIONS / name, filename=name)
+    return FileResponse(sessions / name, filename=name)
 
 
 @app.websocket("/ws")
@@ -101,7 +103,8 @@ async def ws_endpoint(ws: WebSocket) -> None:
         return
     await ws.accept()
     stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
-    transcript_path, qa_path = SESSIONS / f"{stamp}_transcript.txt", SESSIONS / f"{stamp}_qa.jsonl"
+    sessions = state["talk"].sessions
+    transcript_path, qa_path = sessions / f"{stamp}_transcript.txt", sessions / f"{stamp}_qa.jsonl"
     started = time.monotonic()
     send_lock, evaluating = asyncio.Lock(), asyncio.Lock()
     lines: list[str] = []
@@ -126,9 +129,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
     async def run_once(note: str) -> None:
         answerer: Answerer | None = state["answerer"]
         if answerer is None:
-            await send(
-                {"type": "error", "text": "沒有 Claude API key：請填 tools/qa_assistant/.env 後重開。"}
-            )
+            await send({"type": "error", "text": "沒有 Claude API key：請填這個 repo 的 .env 後重開。"})
             return
         if not lines and not note:
             return
@@ -176,7 +177,8 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 try:
                     await task
                 except asyncio.CancelledError:
-                    if asyncio.current_task().cancelling():
+                    me = asyncio.current_task()
+                    if me is not None and me.cancelling():
                         raise
                 note, flags["rerun"] = flags["rerun"], ""
                 if not note:
@@ -242,7 +244,9 @@ async def ws_endpoint(ws: WebSocket) -> None:
         async def on_final(text: str) -> None:
             await add_line(speaker, text)
 
-        spawn(Transcriber(key, send_tagged, on_interim, on_final).run(queues[channel]))
+        spawn(
+            Transcriber(key, state["talk"].vocabulary, send_tagged, on_interim, on_final).run(queues[channel])
+        )
 
     async def stop_all() -> None:
         for channel in list(queues):
@@ -256,6 +260,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
             "gemini_key": bool(config.gemini_key()),
             "cache_tokens": state["warm_tokens"],
             "warm_error": state["warm_error"],
+            "title": state["talk"].title,
             "transcript": transcript_path.name,
             "qa": qa_path.name,
         }

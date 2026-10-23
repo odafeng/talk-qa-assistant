@@ -1,0 +1,11 @@
+# Secrets and the talk you are preparing stay local
+.env
+talk.toml
+sessions/
+qa_sessions/
+
+.venv/
+__pycache__/
+.pytest_cache/
+.ruff_cache/
+.DS_Store
