@@ -83,6 +83,7 @@ function render(card, force = false) {
   const head = card.raw.trimStart();
   if (!force && !head.startsWith("【")) return;
   if (!card.el) {
+    card.prev = document.querySelector(".card.newest");
     document.querySelectorAll(".card.newest").forEach(el => el.classList.remove("newest"));
     $("answers").querySelector(".empty")?.remove();
     card.el = document.createElement("div");
@@ -93,6 +94,12 @@ function render(card, force = false) {
       card.el.append(d);
     }
     $("answers").prepend(card.el);
+  }
+  // An update replaces the card it updates: fold the previous one so each question has one live card.
+  // Decided once enough of the reply has streamed to see whether it starts with （更新）.
+  if (card.prev && card.updateChecked === undefined && head.length >= 8) {
+    card.updateChecked = /^【問題】\s*（更新）/.test(head);
+    if (card.updateChecked) card.prev.classList.add("folded");
   }
   const body = card.el.querySelector(".body");
   body.textContent = "";

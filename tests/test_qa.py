@@ -72,11 +72,19 @@ def test_context_sends_the_paper_as_page_text_and_caches_the_notes(talk_dir):
     assert "測試講者" in answerer.system_prompt(talk) and "{speaker}" not in answerer.system_prompt(talk)
 
 
-def test_request_block_lists_answered_questions_then_the_transcript():
+def test_request_block_separates_seen_and_new_lines():
     answered = [f"q{i}" for i in range(10)]
-    text = answerer._request_block(["[00:01] 聽眾：請問 flow 呢"], answered, "NOTE")["text"]
+    text = answerer._request_block(["[00:01] 聽眾：舊的話"], ["[00:09] 聽眾：新的問題"], answered, "NOTE")[
+        "text"
+    ]
     assert "- q1\n" not in text and "- q2" in text and "- q9" in text
-    assert text.index("已經回答過") < text.index("最近的逐字稿") < text.index("NOTE")
+    assert text.index("已經回答過") < text.index("之前的逐字稿") < text.index("新逐字稿") < text.index("NOTE")
+    assert text.index("舊的話") < text.index("之前的逐字稿") + 40 < text.index("新的問題")
+
+
+def test_request_block_without_history_has_only_new_lines():
+    text = answerer._request_block([], ["[00:01] 聽眾：請問"], [])["text"]
+    assert "之前的逐字稿" not in text and "已經回答過" not in text and "請問" in text
 
 
 def test_answer_status_and_question_extraction():
@@ -135,8 +143,8 @@ class FakeAnswerer:
     def __init__(self):
         self.calls = []
 
-    async def stream(self, transcript, answered, note=""):
-        self.calls.append((list(transcript), list(answered), note))
+    async def stream(self, seen, new, answered, note=""):
+        self.calls.append((list(seen), list(new), list(answered), note))
         yield "【問題】flow 只在訓練用嗎？"
         yield "\n【口語稿】是的，只在訓練時用。"
         yield answerer.Answer(
@@ -166,6 +174,24 @@ def test_manual_question_streams_a_spoken_answer(monkeypatch, talk_config):
         "thinking",
     ]
     assert events[5]["status"] == "answer" and events[5]["citations"][0]["page"] == 4
-    transcript, answered, note = fake.calls[0]
-    assert transcript[-1].endswith("我（手動輸入的問題）：flow 只在訓練時用嗎") and answered == []
+    seen, new, answered, note = fake.calls[0]
+    assert seen == [] and new[-1].endswith("我（手動輸入的問題）：flow 只在訓練時用嗎") and answered == []
     assert "不要輸出 SKIP 或 WAIT" in note
+
+
+def test_lines_already_answered_are_sent_as_context_not_as_new(monkeypatch, talk_config):
+    monkeypatch.setattr(config, "anthropic_key", lambda: "")
+    fake = FakeAnswerer()
+    with TestClient(app_module.app) as client:
+        monkeypatch.setitem(app_module.state, "answerer", fake)
+        with client.websocket_connect("/ws", headers=ORIGIN) as ws:
+            ws.receive_json()  # hello
+            for question in ("第一題", "第二題"):
+                ws.send_json({"type": "ask", "text": question})
+                while ws.receive_json()["type"] != "answer_done":
+                    pass
+    (_, first_new, _, _), (second_seen, second_new, second_answered, _) = fake.calls
+    assert len(first_new) == 1 and first_new[0].endswith("第一題")
+    assert len(second_seen) == 1 and second_seen[0].endswith("第一題")
+    assert len(second_new) == 1 and second_new[0].endswith("第二題")
+    assert second_answered == ["flow 只在訓練用嗎？"]

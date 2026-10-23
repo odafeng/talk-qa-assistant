@@ -26,7 +26,7 @@ SYSTEM_TEMPLATE = """你是講者的即時 Q&A 助手。講者{speaker}正在{ve
 你的工作：找出聽眾最近提出、而且還沒回答過的問題，給講者一份可以直接唸的口語稿。
 
 只輸出下面三種之一：
-1. SKIP：最近的聽眾發言裡沒有新的問題（寒暄、「聽得到嗎」、「謝謝」、主持人串場、講者自己在說話、或問題已經回答過而且沒有追問）。只輸出這四個字母。
+1. SKIP：「新逐字稿」裡沒有需要新回答的問題。包括：寒暄、「聽得到嗎」、「謝謝」、主持人串場、講者自己在說話；聽眾只是附和（「對」「好，大概」「了解」）、重述自己的理解而且理解正確、或把已經回答過的問題再講一次；講者（「我」）已經在新逐字稿裡回答了聽眾的話。只輸出這四個字母。
 2. WAIT：聽眾的問題看起來還沒說完（話講到一半、只有開場白「我想請問一下…」）。只輸出這四個字母。如果訊息裡註明「對方已經停下來了」，就不要再輸出 WAIT。
 3. 回答，格式如下：
 
@@ -41,7 +41,11 @@ SYSTEM_TEMPLATE = """你是講者的即時 Q&A 助手。講者{speaker}正在{ve
 - 原文沒寫的事，直接說原文沒寫，不要編造數字、作者意圖或實驗。
 - 講者筆記裡已經整理過的題目（例如 Q&A 預備、原文對不上的地方），優先沿用，但數字以原文為準。
 - 講者自己（「我」）已經回答了一部分時，口語稿要接著補充，不要重複他已經說過的。
-- 聽眾問題常常斷斷續續、被停頓切成好幾行，要把同一個人連續的幾行合起來理解。如果聽眾是在補充或修正一個已經回答過的問題，就重新給一份完整的回答，並在【問題】開頭寫「（更新）」。
+- 聽眾問題常常斷斷續續、被停頓切成好幾行，要把同一個人連續的幾行合起來理解。
+- 只看「新逐字稿」決定要不要回答；「之前的逐字稿」已經判斷過，只當上下文。
+- 回答之前先比對「已經回答過的問題」：新逐字稿問的如果是同一題（只是講完、換句話說、或再確認一次），輸出 SKIP，除非裡面有新的子問題。
+- 聽眾只是附和或表示理解時（「好，大概」「對」「了解」），即使你覺得講者剛才的說法不夠精確，也輸出 SKIP；需要更正的地方，等聽眾下一次提問時再寫進【注意】。
+- 「（更新）」要很節制：只有新逐字稿裡聽眾提出了新的子問題，或聽眾有會影響理解的誤解、而講者還沒更正時，才重新回答，並在【問題】開頭寫「（更新）」。同一個問題只是又被提到、聽眾在消化講者的回答、或講者已經回應過，都輸出 SKIP。
 - 不要在回答最後另外列出原文句子，原文引句會由系統附在卡片下方。
 - 講者不是這篇論文的作者。口語稿提到論文的做法時要說「作者」或「論文」，不要說「我們」。"""
 
@@ -96,11 +100,14 @@ class Answer:
         return m.group(1).strip() if m else ""
 
 
-def _request_block(transcript: list[str], answered: list[str], note: str = "") -> dict:
+def _request_block(seen: list[str], new: list[str], answered: list[str], note: str = "") -> dict:
+    """seen: lines an earlier verdict already covered (context only); new: lines since then."""
     parts = []
     if answered:
         parts.append("已經回答過的問題：\n" + "\n".join(f"- {q}" for q in answered[-8:]))
-    parts.append("最近的逐字稿（由舊到新）：\n" + "\n".join(transcript))
+    if seen:
+        parts.append("之前的逐字稿（已經判斷過，只當上下文）：\n" + "\n".join(seen))
+    parts.append("新逐字稿（上次判斷之後才說的，由舊到新）：\n" + ("\n".join(new) or "（沒有）"))
     if note:
         parts.append(note)
     return {"type": "text", "text": "\n\n".join(parts)}
@@ -144,10 +151,10 @@ class Answerer:
         return response.usage.cache_creation_input_tokens + response.usage.cache_read_input_tokens
 
     async def stream(
-        self, transcript: list[str], answered: list[str], note: str = ""
+        self, seen: list[str], new: list[str], answered: list[str], note: str = ""
     ) -> AsyncIterator[str | Answer]:
         """Yield text deltas, then one final Answer."""
-        content = [*self.context, _request_block(transcript, answered, note)]
+        content = [*self.context, _request_block(seen, new, answered, note)]
         async with self.client.beta.messages.stream(**self._params(content, MAX_TOKENS)) as stream:
             async for text in stream.text_stream:
                 yield text

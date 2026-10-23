@@ -111,7 +111,9 @@ async def ws_endpoint(ws: WebSocket) -> None:
     answered: list[str] = []
     queues: dict[int, asyncio.Queue] = {}
     tasks: set[asyncio.Task] = set()
-    flags = {"auto": True, "rerun": "", "waiting": False, "next_id": 1}
+    # "seen": how many transcript lines an answer or SKIP has already covered. Only lines after it
+    # can trigger an answer, so one question is not re-answered each time someone echoes it.
+    flags = {"auto": True, "rerun": "", "waiting": False, "next_id": 1, "seen": 0}
     # The evaluation in flight; it can be restarted until its answer starts showing on screen.
     current: dict = {"task": None, "note": "", "visible": False}
     segmenter = Segmenter()
@@ -139,7 +141,10 @@ async def ws_endpoint(ws: WebSocket) -> None:
         state["last_call"] = time.monotonic()
         shown = ""
         try:
-            async for piece in answerer.stream(lines[-WINDOW_LINES:], answered, note):
+            end = len(lines)
+            start = max(0, end - WINDOW_LINES)
+            seen, new = lines[start : max(start, flags["seen"])], lines[max(start, flags["seen"]) : end]
+            async for piece in answerer.stream(seen, new, answered, note):
                 if not isinstance(piece, Answer):
                     shown += piece
                     current["visible"] = shown.lstrip().startswith("【")
@@ -148,6 +153,8 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 if piece.status == "answer":
                     answered.append(piece.question or "（未擷取到問題）")
                 flags["waiting"] = piece.status == "wait"
+                if piece.status in ("answer", "skip"):  # a WAIT keeps its lines new for the next look
+                    flags["seen"] = max(flags["seen"], end)
                 with qa_path.open("a", encoding="utf-8") as f:
                     f.write(
                         json.dumps(
