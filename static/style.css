@@ -46,6 +46,7 @@ button.primary.live { background: transparent; color: var(--tally); border-color
 .settings .panel { position: absolute; right: 0; top: calc(100% + 6px); z-index: 2; display: grid; gap: 2px;
   min-width: 180px; padding: 6px; background: var(--raised); border: 1px solid var(--rule); border-radius: 6px; }
 .settings .panel > * { padding: 6px 8px; white-space: nowrap; }
+.ctx-info { margin: 0; color: var(--soft); font-size: 13px; white-space: normal; max-width: 240px; }
 .warn { margin: 0; padding: 8px 20px; background: #3a2230; color: var(--alert); font-size: 14px; }
 
 /* Layout */

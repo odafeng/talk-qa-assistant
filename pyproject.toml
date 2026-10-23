@@ -12,6 +12,7 @@ dependencies = [
     "python-dotenv>=1.0",
     "opencc-python-reimplemented>=0.1.7",
     "typesafe-sdk>=0.7,<0.8",
+    "pillow>=13.0.0",
 ]
 
 [dependency-groups]

@@ -1,10 +1,14 @@
 """Answer audience questions with Claude, grounded in the talk's paper and the speaker's notes."""
 
+import base64
+import io
 import re
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from pathlib import Path
 
 import anthropic
+from PIL import Image
 
 from slides import deck_map
 from talk import Talk, paper_pages
@@ -39,6 +43,7 @@ SYSTEM_TEMPLATE = """你是講者的即時 Q&A 助手。講者{speaker}正在{ve
 規則：
 - 只根據提供的論文原文和講者筆記回答。論文是唯一的權威來源；講者筆記裡標成 MY ANALYSIS、批判、推論的內容是講者自己的看法，用的時候要在【注意】說明。
 - 原文沒寫的事，直接說原文沒寫，不要編造數字、作者意圖或實驗。
+- 資料裡也可能有圖片（論文的圖表、投影片截圖等），每張前面標了檔名。問題牽涉到圖表時可以參考；只有圖裡看得到的資訊，在【依據】寫出檔名。
 - 講者筆記裡已經整理過的題目（例如 Q&A 預備、原文對不上的地方），優先沿用，但數字以原文為準。
 - 講者自己（「我」）已經回答了一部分時，口語稿要接著補充，不要重複他已經說過的。
 - 聽眾問題常常斷斷續續、被停頓切成好幾行，要把同一個人連續的幾行合起來理解。
@@ -54,38 +59,100 @@ def system_prompt(talk: Talk) -> str:
     return SYSTEM_TEMPLATE.format(speaker=talk.speaker, venue=talk.venue, title=talk.title)
 
 
-def build_context(talk: Talk) -> tuple[list[dict], list[int]]:
-    """The cached prefix (paper pages + speaker materials) and the page number of each paper block.
+MAX_IMAGES = 100  # Claude API per-request image limit
+IMAGE_EDGE = 1568  # Claude resizes anything larger anyway; sending it smaller saves tokens and upload
 
-    The paper goes in as page text rather than the PDF: half the tokens (88k vs 173k on the
-    SurgiFlowVid talk) and much faster, while table numbers were still answered correctly.
+
+def _image_block(path: Path) -> dict:
+    """An image as a base64 block, scaled down so its long edge is at most IMAGE_EDGE."""
+    with Image.open(path) as img:
+        fmt = "JPEG" if img.format == "JPEG" else "PNG"
+        if max(img.size) > IMAGE_EDGE:
+            img.thumbnail((IMAGE_EDGE, IMAGE_EDGE))
+        if fmt == "JPEG" and img.mode not in ("RGB", "L"):
+            img = img.convert("RGB")
+        buffer = io.BytesIO()
+        img.save(buffer, format=fmt, **({"quality": 85} if fmt == "JPEG" else {}))
+    data = base64.standard_b64encode(buffer.getvalue()).decode("ascii")
+    media = "image/jpeg" if fmt == "JPEG" else "image/png"
+    return {"type": "image", "source": {"type": "base64", "media_type": media, "data": data}}
+
+
+@dataclass(frozen=True)
+class Context:
+    """The cached prefix plus what is needed to turn citations back into pages.
+
+    Images slow every answer down (first text 0.8-2 s without them, 6-10 s with 29 figures on the
+    SurgiFlowVid talk), so they sit behind a second cache breakpoint and are sent only when the
+    question is about a figure or table (needs_images). Both prefixes are pre-warmed.
     """
-    pages = paper_pages(talk.paper)
+
+    text_blocks: list[dict]  # papers, then the speaker's notes (cache breakpoint 1)
+    image_blocks: list[dict]  # label + image per file (cache breakpoint 2 on the last one)
+    pages: list[list[int]]  # pages[document][block] -> page number
+    papers: list[str]  # document titles, in order
+    images: int
+
+    def blocks(self, with_images: bool) -> list[dict]:
+        return self.text_blocks + (self.image_blocks if with_images else [])
+
+
+# A question about what a figure shows: only then are the images worth their latency (+5-6 s,
+# measured). Tables are left out: pdftotext keeps their numbers, which were answered correctly.
+FIGURE_WORDS = re.compile(r"圖|fig|figure|畫面|截圖|照片|顏色|長什麼樣|看起來", re.IGNORECASE)
+
+
+def needs_images(texts: list[str]) -> bool:
+    return any(FIGURE_WORDS.search(t) for t in texts)
+
+
+def build_context(talk: Talk) -> Context:
+    """Papers as per-page text documents and the speaker's notes, then the images (ADR 0005).
+
+    Papers go in as page text rather than as PDFs: half the tokens (88k vs 173k on the SurgiFlowVid
+    talk) and much faster, while table numbers were still answered correctly (ADR 0002).
+    """
+    text_blocks, pages, papers = [], [], []
+    for path in talk.papers:
+        page_texts = paper_pages(path)
+        title = path.name.removesuffix(".paper.txt") if path.name.endswith(".paper.txt") else path.stem
+        text_blocks.append(
+            {
+                "type": "document",
+                "source": {
+                    "type": "content",
+                    "content": [{"type": "text", "text": f"[{title} 第 {n} 頁]\n{t}"} for n, t in page_texts],
+                },
+                "title": f"論文原文：{title}",
+                "citations": {"enabled": True},
+            }
+        )
+        pages.append([n for n, _ in page_texts])
+        papers.append(title)
     sections = ["以下是講者自己的材料，不是論文原文。"]
     if talk.slides:
         sections.append(f"## 投影片頁碼對照\n{deck_map(talk.slides, talk.body_pages)}")
-    sections += [f"## {note.name}\n{note.read_text(encoding='utf-8')}" for note in talk.notes]
-    paper = {
-        "type": "document",
-        "source": {
-            "type": "content",
-            "content": [{"type": "text", "text": f"[論文第 {n} 頁]\n{text}"} for n, text in pages],
-        },
-        "title": f"{talk.title} 論文原文，逐頁文字",
-        "citations": {"enabled": True},
-    }
-    notes = {
-        "type": "text",
-        "text": "\n\n".join(sections),
-        "cache_control": {"type": "ephemeral", "ttl": "1h"},
-    }
-    return [paper, notes], [n for n, _ in pages]
+    sections += [
+        f"## {note.relative_to(talk.folder)}\n{note.read_text(encoding='utf-8')}" for note in talk.notes
+    ]
+    text_blocks.append(
+        {"type": "text", "text": "\n\n".join(sections), "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+    )
+    images = talk.images[:MAX_IMAGES]
+    image_blocks: list[dict] = []
+    for path in images:
+        image_blocks.append({"type": "text", "text": f"圖片：{path.relative_to(talk.folder)}"})
+        image_blocks.append(_image_block(path))
+    if image_blocks:
+        image_blocks[-1] = {**image_blocks[-1], "cache_control": {"type": "ephemeral", "ttl": "1h"}}
+    return Context(text_blocks, image_blocks, pages, papers, len(images))
 
 
 @dataclass
 class Citation:
     page: int
     text: str
+    paper: str = ""
 
 
 @dataclass
@@ -113,25 +180,31 @@ def _request_block(seen: list[str], new: list[str], answered: list[str], note: s
     return {"type": "text", "text": "\n\n".join(parts)}
 
 
-def _citations(message, page_numbers: list[int]) -> list[Citation]:
+def _citations(message, context: Context) -> list[Citation]:
     seen, out = set(), []
     for block in message.content:
         for c in getattr(block, "citations", None) or []:
-            index = getattr(c, "start_block_index", None)
-            page = page_numbers[index] if index is not None and index < len(page_numbers) else None
+            doc, index = getattr(c, "document_index", 0) or 0, getattr(c, "start_block_index", None)
+            doc_pages = context.pages[doc] if doc < len(context.pages) else []
+            page = doc_pages[index] if index is not None and index < len(doc_pages) else None
             text = re.sub(r"\s+", " ", getattr(c, "cited_text", "")).strip()
-            if page is None or (page, text) in seen:
+            if page is None or (doc, page, text) in seen:
                 continue
-            seen.add((page, text))
-            out.append(Citation(page=page, text=text[:200]))
+            seen.add((doc, page, text))
+            paper = context.papers[doc] if len(context.papers) > 1 else ""
+            out.append(Citation(page=page, text=text[:200], paper=paper))
     return out
 
 
 class Answerer:
     def __init__(self, api_key: str, talk: Talk) -> None:
         self.client = anthropic.AsyncAnthropic(api_key=api_key)
+        self.reload(talk)
+
+    def reload(self, talk: Talk) -> None:
+        """Rebuild the cached prefix from the context folder (new files are used from the next call)."""
         self.system = system_prompt(talk)
-        self.context, self.page_numbers = build_context(talk)
+        self.context = build_context(talk)
 
     def _params(self, content: list[dict], max_tokens: int) -> dict:
         return {
@@ -146,15 +219,19 @@ class Answerer:
         }
 
     async def prewarm(self) -> int:
-        """Write the paper and notes into the prompt cache so the first real answer is fast."""
-        response = await self.client.beta.messages.create(**self._params(self.context, 0))
-        return response.usage.cache_creation_input_tokens + response.usage.cache_read_input_tokens
+        """Write both prefixes (text only, then text + images) into the cache so neither starts cold."""
+        total = 0
+        for with_images in (False, True) if self.context.image_blocks else (False,):
+            blocks = self.context.blocks(with_images)
+            response = await self.client.beta.messages.create(**self._params(blocks, 0))
+            total = response.usage.cache_creation_input_tokens + response.usage.cache_read_input_tokens
+        return total
 
     async def stream(
-        self, seen: list[str], new: list[str], answered: list[str], note: str = ""
+        self, seen: list[str], new: list[str], answered: list[str], note: str = "", with_images: bool = False
     ) -> AsyncIterator[str | Answer]:
-        """Yield text deltas, then one final Answer."""
-        content = [*self.context, _request_block(seen, new, answered, note)]
+        """Yield text deltas, then one final Answer. Images are sent only when with_images."""
+        content = [*self.context.blocks(with_images), _request_block(seen, new, answered, note)]
         async with self.client.beta.messages.stream(**self._params(content, MAX_TOKENS)) as stream:
             async for text in stream.text_stream:
                 yield text
@@ -164,4 +241,4 @@ class Answerer:
             status = "refused"
         else:
             status = {SKIP: "skip", WAIT: "wait"}.get(text, "answer")
-        yield Answer(text=text, citations=_citations(message, self.page_numbers), status=status)
+        yield Answer(text=text, citations=_citations(message, self.context), status=status)

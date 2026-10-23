@@ -41,15 +41,29 @@ def test_long_monologue_is_cut_at_the_cap():
     assert s.add_final("六七八九十", now=0.5) == "一二三四五 六七八九十"
 
 
-def test_talk_config_resolves_paths_next_to_the_file(talk_dir):
-    talk = talk_config.load(talk_dir / "talk.toml")
-    assert talk.speaker == "測試講者" and talk.paper == talk_dir / "paper.txt"
-    assert talk.notes == (talk_dir / "script.md", talk_dir / "outline.md")
-    assert talk.sessions == talk_dir / "sessions" and talk.vocabulary == ("TestPaper",)
+def test_context_folder_sorts_files_by_type(talk_dir):
+    talk = talk_config.load(talk_dir)
+    assert talk.speaker == "測試講者" and talk.vocabulary == ("TestPaper",)
+    assert talk.papers == (talk_dir / "paper.paper.txt",)
+    assert talk.notes == (talk_dir / "outline.txt", talk_dir / "script.md")  # sessions/ is skipped
+    assert talk.images == (talk_dir / "figures" / "table2.png",)
+    assert talk.slides == talk_dir / "index.tsx" and talk.sessions == talk_dir / "sessions"
+
+
+def test_context_folder_works_without_talk_toml(talk_dir):
+    (talk_dir / "talk.toml").unlink()
+    talk = talk_config.load(talk_dir)
+    assert talk.title == "project" and talk.speaker == "講者" and talk.body_pages is None
+
+
+def test_signature_changes_when_a_file_is_added(talk_dir):
+    before = talk_config.signature(talk_dir)
+    (talk_dir / "new_note.md").write_text("補充", encoding="utf-8")
+    assert talk_config.signature(talk_dir) != before
 
 
 def test_paper_pages_keep_page_numbers_and_skip_blank_pages(talk_dir):
-    pages = talk_config.paper_pages(talk_dir / "paper.txt")
+    pages = talk_config.paper_pages(talk_dir / "paper.paper.txt")
     assert [n for n, _ in pages] == [1, 3]
 
 
@@ -61,12 +75,23 @@ def test_deck_map_lists_every_page_and_marks_backup(talk_dir):
     ]
 
 
-def test_context_sends_the_paper_as_page_text_and_caches_the_notes(talk_dir):
-    talk = talk_config.load(talk_dir / "talk.toml")
-    (paper, notes), pages = answerer.build_context(talk)
-    blocks = paper["source"]["content"]
-    assert paper["citations"] == {"enabled": True} and pages == [1, 3]
-    assert blocks[1]["text"].startswith("[論文第 3 頁]")
+def test_context_has_papers_then_images_then_cached_notes(talk_dir):
+    import base64
+    import io
+
+    from PIL import Image
+
+    talk = talk_config.load(talk_dir)
+    ctx = answerer.build_context(talk)
+    paper, notes = ctx.text_blocks
+    label, image = ctx.image_blocks
+    assert ctx.blocks(False) == [paper, notes] and ctx.blocks(True) == [paper, notes, label, image]
+    assert image["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
+    assert paper["citations"] == {"enabled": True} and ctx.pages == [[1, 3]] and ctx.papers == ["paper"]
+    assert paper["source"]["content"][1]["text"].startswith("[paper 第 3 頁]")
+    assert label["text"] == "圖片：figures/table2.png" and ctx.images == 1
+    shrunk = Image.open(io.BytesIO(base64.b64decode(image["source"]["data"])))
+    assert max(shrunk.size) == answerer.IMAGE_EDGE  # 3000 px wide scaled down
     assert notes["cache_control"] == {"type": "ephemeral", "ttl": "1h"}
     assert "Q&A 預備" in notes["text"] and "第 3 頁：Extra（Backup）" in notes["text"]
     assert "測試講者" in answerer.system_prompt(talk) and "{speaker}" not in answerer.system_prompt(talk)
@@ -94,16 +119,23 @@ def test_answer_status_and_question_extraction():
 
 
 def test_citations_are_deduplicated_and_keep_page_numbers():
-    cite = SimpleNamespace(start_block_index=1, cited_text="flow is used\n only in training")
-    message = SimpleNamespace(
-        content=[
-            SimpleNamespace(citations=[cite, cite]),
-            SimpleNamespace(citations=None),
-        ]
+    cite = SimpleNamespace(
+        document_index=0, start_block_index=1, cited_text="flow is used\n only in training"
     )
-    assert answerer._citations(message, [1, 7, 8]) == [
+    message = SimpleNamespace(
+        content=[SimpleNamespace(citations=[cite, cite]), SimpleNamespace(citations=None)]
+    )
+    ctx = answerer.Context([], [], pages=[[1, 7, 8]], papers=["paper"], images=0)
+    assert answerer._citations(message, ctx) == [
         answerer.Citation(page=7, text="flow is used only in training")
     ]
+
+
+def test_citations_name_the_paper_when_there_are_several():
+    cite = SimpleNamespace(document_index=1, start_block_index=0, cited_text="x")
+    message = SimpleNamespace(content=[SimpleNamespace(citations=[cite])])
+    ctx = answerer.Context([], [], pages=[[1, 2], [5, 6]], papers=["a", "b"], images=0)
+    assert answerer._citations(message, ctx) == [answerer.Citation(page=5, text="x", paper="b")]
 
 
 ORIGIN = {"origin": "http://localhost:8777"}
@@ -142,8 +174,9 @@ def test_download_only_serves_session_files(monkeypatch, talk_config):
 class FakeAnswerer:
     def __init__(self):
         self.calls = []
+        self.context = answerer.Context([], [], pages=[], papers=[], images=0)
 
-    async def stream(self, seen, new, answered, note=""):
+    async def stream(self, seen, new, answered, note="", with_images=False):
         self.calls.append((list(seen), list(new), list(answered), note))
         yield "【問題】flow 只在訓練用嗎？"
         yield "\n【口語稿】是的，只在訓練時用。"
@@ -195,3 +228,25 @@ def test_lines_already_answered_are_sent_as_context_not_as_new(monkeypatch, talk
     assert len(second_seen) == 1 and second_seen[0].endswith("第一題")
     assert len(second_new) == 1 and second_new[0].endswith("第二題")
     assert second_answered == ["flow 只在訓練用嗎？"]
+
+
+def test_init_creates_context_folder_and_launcher(tmp_path):
+    import os
+
+    import qa
+
+    folder = qa.init(tmp_path / "talk")
+    launcher = folder / "QA_Assistant.command"
+    assert (folder / "sessions").is_dir() and os.access(launcher, os.X_OK)
+    assert f'APP="{qa.HERE}"' in launcher.read_text(encoding="utf-8")
+    assert 'title = "talk"' in (folder / "talk.toml").read_text(encoding="utf-8")
+    (folder / "talk.toml").write_text('title = "kept"', encoding="utf-8")
+    qa.init(tmp_path / "talk")  # running again keeps the user's talk.toml
+    assert (folder / "talk.toml").read_text(encoding="utf-8") == 'title = "kept"'
+
+
+def test_images_are_sent_only_for_figure_questions():
+    assert answerer.needs_images(["[00:30] 聽眾：Fig. 5 那個失敗的例子錯在哪？"])
+    assert answerer.needs_images(["生成的畫面看起來真實嗎"])
+    assert not answerer.needs_images(["Table 2 的 Jaccard 是多少", "那張表的數字"])  # tables are in the text
+    assert not answerer.needs_images(["optical flow 只在訓練的時候用嗎？", "表現有比較好嗎"])

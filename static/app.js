@@ -55,10 +55,12 @@ function handle(ev) {
       if (!ev.gemini_key) problems.push("沒有 Gemini API key：在 talk-qa-assistant/.env 填好後重開");
       if (ev.warm_error) problems.push("Claude 預熱失敗：" + ev.warm_error);
       warn(problems.join("。"));
+      showContext(ev.context);
       $("dlTranscript").href = "/download/" + ev.transcript;
       $("dlQa").href = "/download/" + ev.qa;
       break;
     }
+    case "context": showContext(ev); setStatus("參考資料已更新", listening ? "on" : ""); break;
     case "status": if (listening) setStatus("聆聽中", "on"); break;
     case "error": warn(ev.text); break;
     case "thinking": thinking = ev.on; paintStatus(); break;
@@ -69,6 +71,13 @@ function handle(ev) {
     case "answer_done": finish(ev); break;
     case "answer_error": { const a = answers.get(ev.id); a.raw = "【注意】" + ev.text; a.done = true; update(a, true); break; }
   }
+}
+
+function showContext(c) {
+  const parts = [`${c.papers} 篇論文`, `${c.notes} 份筆記`, `${c.images} 張圖`];
+  if (c.slides) parts.push("投影片頁碼");
+  $("ctxInfo").textContent = "參考資料：" + parts.join("、");
+  $("ctxInfo").title = c.folder;
 }
 
 function addLine(ev) {

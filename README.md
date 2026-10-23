@@ -27,24 +27,32 @@ Meet 分頁音訊（聽眾） ─┐                          ┌─ 不用回�
 
 ```bash
 uv sync
-cp .env.example .env              # 填入 Claude、Gemini 的 key（Jev 選配）
-cp talk.example.toml ~/my-talk/talk.toml   # 放在你的演講資料旁邊，再改內容
+cp .env.example .env                       # 填入 Claude、Gemini 的 key（Jev 選配）
+uv run python qa.py init ~/path/to/project # 在專案裡建立 qa_context/ 和啟動檔
 ```
 
-`talk.toml` 寫這場演講的題目、講者、論文 PDF、講稿與筆記、投影片 deck 和自訂詞彙。它含有個人資料，所以不要放進這個 repo（見 [ADR 0003](docs/adr/0003-talk-materials-outside-the-repo.md)）。
+把這場演講的資料丟進 `qa_context/`，執行中加檔案也會在 10 秒內讀進來：
+
+| 檔案 | 當成 |
+|---|---|
+| `*.pdf`、`*.paper.txt` | 論文（可以好幾篇；轉成逐頁文字，引用會標頁碼） |
+| `*.md`、`*.txt` | 講稿、大綱、Q&A 筆記 |
+| `*.png`、`*.jpg`、`*.webp`、`*.gif` | 圖表、截圖（檔名當說明；只有問到圖時才送，見 [ADR 0005](docs/adr/0005-context-folder-and-images.md)） |
+| `*.tsx` | open-slide 投影片，用來回答「翻到第幾頁」 |
+| `talk.toml` | 選配：題目、講者、場合、專有名詞 |
+
+`qa_context/` 含有你的講稿和個人資料，所以放在你自己的專案裡，不要放進這個 repo。
 
 ## 使用
 
-```bash
-TALK_CONFIG=~/my-talk/talk.toml uv run uvicorn app:app --port 8777
-```
+雙擊 `qa_context/QA_Assistant.command`（或手動執行 `QA_CONTEXT=~/path/to/project/qa_context uv run uvicorn app:app --port 8777`）。
 
 1. 用 Chrome 打開 http://localhost:8777 ，按「開始聆聽」。
-2. 選 **Meet 的分頁**，並勾選 **「同時分享分頁音訊」**。
-3. 聽眾提問後，右邊會出現卡片：【問題】【口語稿】【依據】【翻到】【注意】，下方附原文引句和頁碼。
+2. 選**會議的分頁**（Meet、Zoom 網頁版、Teams 網頁版都可以），並打開**「同時分享分頁音訊」**。
+3. 聽眾提問後，舞台上會出現口語稿：問題、可以直接唸的回答、翻到哪一頁、依據和注意事項。
 4. 漏抓時可以按「現在回答」，或在下方輸入框手動打問題。
 
-在 Meet 裡分享投影片分頁就好，這個頁面不會被分享出去。Q&A 開始前就先按「開始聆聽」，按之前講的話它聽不到。
+在會議裡分享投影片分頁就好，這個頁面不會被分享出去。Q&A 開始前就先按「開始聆聽」，按之前講的話它聽不到。
 
 ## 開發
 
@@ -55,7 +63,7 @@ uv run pyright
 uv run pre-commit install        # commit 前自動跑上面這些
 ```
 
-測試用 `tests/conftest.py` 裡的迷你假演講，不需要真實的論文或 API key。
+測試用 `tests/conftest.py` 裡的迷你假專案（含一張測試圖片），不需要真實的論文或 API key。
 
 ## 設計紀錄
 
@@ -63,9 +71,10 @@ uv run pre-commit install        # commit 前自動跑上面這些
 - [0002 用 Claude Sonnet 5.5（不思考）加論文逐頁文字來回答](docs/adr/0002-claude-sonnet-with-page-text-context.md)
 - [0003 演講資料放在 repo 外，用 talk.toml 指過去](docs/adr/0003-talk-materials-outside-the-repo.md)
 - [0004 先讓 Jev 判斷要不要回答，有把握才照它的判斷](docs/adr/0004-jev-gate-before-claude.md)
+- [0005 每個專案一個 qa_context 資料夾，圖片只在問到圖時才送](docs/adr/0005-context-folder-and-images.md)
 
 ## 隱私
 
-- 逐字稿和問答紀錄寫在 `talk.toml` 指定的資料夾，不會進這個 repo。
+- 逐字稿和問答紀錄寫在 `qa_context/sessions/`，`init` 會建一個 `.gitignore` 把它排除。
 - 會議音訊會送到 Google（Gemini），逐字稿和你的筆記會送到 Anthropic（Claude）；有設定 Jev 的話，逐字稿也會送到 TypeSafe。錄別人的聲音之前，先確認會議允許。
 - 本機服務只接受來自 `localhost:8777` 頁面的連線，其他網站連不進來。

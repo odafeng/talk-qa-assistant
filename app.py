@@ -1,6 +1,6 @@
 """Local web app: Meet tab + mic audio -> Gemini Live transcript -> Claude spoken answers, in the browser.
 
-Run from this folder:  TALK_CONFIG=/path/to/talk.toml uv run uvicorn app:app --port 8777
+Run from this folder:  QA_CONTEXT=/path/to/project/qa_context uv run uvicorn app:app --port 8777
 """
 
 import asyncio
@@ -20,7 +20,7 @@ from fastapi.staticfiles import StaticFiles
 
 import config
 import talk as talk_config
-from answerer import Answer, Answerer, _request_block
+from answerer import Answer, Answerer, _request_block, needs_images
 from gate import Gate, Verdict, route
 from segmenter import Segmenter
 from transcriber import Transcriber
@@ -46,7 +46,9 @@ state: dict = {
     "warm_tokens": 0,
     "last_call": 0.0,
     "warm_error": "",
+    "clients": set(),  # send() of each open page, to announce a context reload
 }
+WATCH_SECONDS = 10  # how often the context folder is checked for new or edited files
 
 
 async def _warm() -> None:
@@ -65,14 +67,47 @@ async def _keep_warm() -> None:
             await _warm()
 
 
+def context_summary() -> dict:
+    talk = state["talk"]
+    answerer: Answerer | None = state["answerer"]
+    return {
+        "folder": str(talk.folder),
+        "papers": len(talk.papers),
+        "notes": len(talk.notes),
+        "images": answerer.context.images if answerer else len(talk.images),
+        "slides": talk.slides is not None,
+    }
+
+
+async def _watch_context() -> None:
+    """Pick up files dropped into (or edited in) the context folder without a restart."""
+    last = talk_config.signature(state["talk"].folder)
+    while True:
+        await asyncio.sleep(WATCH_SECONDS)
+        now = talk_config.signature(state["talk"].folder)
+        if now == last:
+            continue
+        last = now
+        try:
+            talk = state["talk"] = talk_config.load(state["talk"].folder)
+            if state["answerer"]:
+                state["answerer"].reload(talk)
+                await _warm()
+        except Exception as e:  # a half-copied file must not stop the watcher
+            log.warning("context reload failed: %s", e)
+            continue
+        for send in list(state["clients"]):
+            await send({"type": "context", **context_summary()})
+
+
 @contextlib.asynccontextmanager
 async def lifespan(_: FastAPI):
     talk = state["talk"] = talk_config.load()
     talk.sessions.mkdir(parents=True, exist_ok=True)
-    background = []
+    background = [asyncio.create_task(_watch_context())]
     if key := config.anthropic_key():
         state["answerer"] = Answerer(key, talk)
-        background = [asyncio.create_task(_warm()), asyncio.create_task(_keep_warm())]
+        background += [asyncio.create_task(_warm()), asyncio.create_task(_keep_warm())]
     if key := config.typesafe_key():
         state["gate"] = Gate(key)
     yield
@@ -95,6 +130,7 @@ async def health() -> dict:
         "anthropic_key": bool(config.anthropic_key()),
         "gemini_key": bool(config.gemini_key()),
         "jev": state["gate"] is not None,
+        "context": context_summary(),
         "cache_tokens": state["warm_tokens"],
         "warm_error": state["warm_error"],
     }
@@ -183,7 +219,8 @@ async def ws_endpoint(ws: WebSocket) -> None:
         state["last_call"] = time.monotonic()
         shown = ""
         try:
-            async for piece in answerer.stream(seen, new, answered, note):
+            with_images = needs_images([*new, note])
+            async for piece in answerer.stream(seen, new, answered, note, with_images=with_images):
                 if not isinstance(piece, Answer):
                     shown += piece
                     current["visible"] = shown.lstrip().startswith("【")
@@ -287,6 +324,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
         for channel in list(queues):
             await queues.pop(channel).put(None)
 
+    state["clients"].add(send)
     spawn(ticker())
     await send(
         {
@@ -296,6 +334,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
             "cache_tokens": state["warm_tokens"],
             "warm_error": state["warm_error"],
             "title": state["talk"].title,
+            "context": context_summary(),
             "transcript": transcript_path.name,
             "qa": qa_path.name,
         }
@@ -324,6 +363,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 await add_line("我（手動輸入的問題）", text)
                 spawn(evaluate(f"講者手動輸入了這個問題，請直接回答，不要輸出 SKIP 或 WAIT：{text}"))
     finally:
+        state["clients"].discard(send)
         await stop_all()
         for task in list(tasks):
             task.cancel()
