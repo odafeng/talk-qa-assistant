@@ -16,6 +16,14 @@ export default [
 """
 
 
+@pytest.fixture(autouse=True)
+def no_jev(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests never call the real Jev API, even when the local .env has a key."""
+    import config
+
+    monkeypatch.setattr(config, "typesafe_key", lambda: "")
+
+
 @pytest.fixture
 def talk_dir(tmp_path: Path) -> Path:
     (tmp_path / "paper.txt").write_text(

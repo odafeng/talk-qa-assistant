@@ -20,7 +20,8 @@ from fastapi.staticfiles import StaticFiles
 
 import config
 import talk as talk_config
-from answerer import Answer, Answerer
+from answerer import Answer, Answerer, _request_block
+from gate import Gate, Verdict, route
 from segmenter import Segmenter
 from transcriber import Transcriber
 
@@ -35,9 +36,17 @@ WINDOW_LINES = 40  # transcript lines sent with each request
 WAIT_FORCE_SECONDS = 5.0  # after a WAIT, answer anyway once the audience has been quiet this long
 FORCE_NOTE = "對方已經停下來了，請直接處理，不要再輸出 WAIT。"
 NOW_NOTE = "講者按了「現在回答」：請回答最近一個聽眾問題，不要輸出 SKIP 或 WAIT。"
+GATE_NOTE = "判斷層已確認新逐字稿裡有聽眾的新問題，請直接回答，不要輸出 SKIP 或 WAIT。"
 
 log = logging.getLogger("qa")
-state: dict = {"talk": None, "answerer": None, "warm_tokens": 0, "last_call": 0.0, "warm_error": ""}
+state: dict = {
+    "talk": None,
+    "answerer": None,
+    "gate": None,
+    "warm_tokens": 0,
+    "last_call": 0.0,
+    "warm_error": "",
+}
 
 
 async def _warm() -> None:
@@ -64,6 +73,8 @@ async def lifespan(_: FastAPI):
     if key := config.anthropic_key():
         state["answerer"] = Answerer(key, talk)
         background = [asyncio.create_task(_warm()), asyncio.create_task(_keep_warm())]
+    if key := config.typesafe_key():
+        state["gate"] = Gate(key)
     yield
     for task in background:
         task.cancel()
@@ -83,6 +94,7 @@ async def health() -> dict:
     return {
         "anthropic_key": bool(config.anthropic_key()),
         "gemini_key": bool(config.gemini_key()),
+        "jev": state["gate"] is not None,
         "cache_tokens": state["warm_tokens"],
         "warm_error": state["warm_error"],
     }
@@ -128,6 +140,15 @@ async def ws_endpoint(ws: WebSocket) -> None:
         tasks.add(task)
         task.add_done_callback(tasks.discard)
 
+    def log(note: str, by: str, verdict: Verdict | None, answer: Answer | None) -> None:
+        entry: dict = {"t": datetime.now().isoformat(timespec="seconds"), "note": note, "by": by}
+        if verdict is not None:
+            entry["jev"] = asdict(verdict)
+        if answer is not None:
+            entry.update(asdict(answer))
+        with qa_path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+
     async def run_once(note: str) -> None:
         answerer: Answerer | None = state["answerer"]
         if answerer is None:
@@ -135,15 +156,33 @@ async def ws_endpoint(ws: WebSocket) -> None:
             return
         if not lines and not note:
             return
+        end = len(lines)
+        start = max(0, end - WINDOW_LINES)
+        seen, new = lines[start : max(start, flags["seen"])], lines[max(start, flags["seen"]) : end]
+
+        # Jev answers "does this need a reply?" in about 0.2 s. A confident no or not-yet ends the
+        # turn without Claude; a confident yes lets Claude skip its own judgment; anything else
+        # (low confidence, Jev down, or a forced request) is judged by Claude as before.
+        verdict = None
+        gate: Gate | None = state["gate"]
+        if gate is not None and not note:
+            verdict = await gate.judge(_request_block(seen, new, answered)["text"])
+            action = route(verdict)
+            if action in ("skip", "wait"):
+                flags["waiting"] = action == "wait"
+                if action == "skip":
+                    flags["seen"] = max(flags["seen"], end)
+                log(note, "jev", verdict, None)
+                return
+            if action == "answer":
+                note = GATE_NOTE
+
         aid = flags["next_id"]
         flags["next_id"] += 1
         await send({"type": "answer_start", "id": aid})
         state["last_call"] = time.monotonic()
         shown = ""
         try:
-            end = len(lines)
-            start = max(0, end - WINDOW_LINES)
-            seen, new = lines[start : max(start, flags["seen"])], lines[max(start, flags["seen"]) : end]
             async for piece in answerer.stream(seen, new, answered, note):
                 if not isinstance(piece, Answer):
                     shown += piece
@@ -155,18 +194,7 @@ async def ws_endpoint(ws: WebSocket) -> None:
                 flags["waiting"] = piece.status == "wait"
                 if piece.status in ("answer", "skip"):  # a WAIT keeps its lines new for the next look
                     flags["seen"] = max(flags["seen"], end)
-                with qa_path.open("a", encoding="utf-8") as f:
-                    f.write(
-                        json.dumps(
-                            {
-                                "t": datetime.now().isoformat(timespec="seconds"),
-                                "note": note,
-                                **asdict(piece),
-                            },
-                            ensure_ascii=False,
-                        )
-                        + "\n"
-                    )
+                log(note, "claude", verdict, piece)
                 await send({"type": "answer_done", "id": aid, **asdict(piece)})
         except anthropic.APIError as e:
             await send({"type": "answer_error", "id": aid, "text": f"{type(e).__name__}: {e}"})

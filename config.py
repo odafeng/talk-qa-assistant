@@ -20,3 +20,8 @@ def anthropic_key() -> str:
 
 def gemini_key() -> str:
     return _key("GEMINI_API_KEY")
+
+
+def typesafe_key() -> str:
+    """Optional: Jev pre-judges each line (gate.py). Without it, Claude judges everything."""
+    return _key("TYPESAFE_API_KEY")
