@@ -7,36 +7,51 @@
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<header>
+<header class="bar">
   <h1 id="title">Q&amp;A 助手</h1>
-  <span id="status" class="pill">連線中…</span>
-  <span id="thinking" class="pill think" hidden>判斷中…</span>
-  <div class="controls">
-    <button id="btnStart" class="primary">開始聆聽</button>
-    <button id="btnStop" disabled>停止</button>
-    <label class="toggle"><input type="checkbox" id="withMic" checked> 也收我的麥克風</label>
-    <label class="toggle"><input type="checkbox" id="auto" checked> 自動擷取問題</label>
+  <p id="status" class="status" role="status">連線中</p>
+  <div class="levels" aria-hidden="true">
+    <span class="level">Meet <meter id="levelTab" min="0" max="100" value="0"></meter></span>
+    <span class="level">我 <meter id="levelMic" min="0" max="100" value="0"></meter></span>
+  </div>
+  <div class="actions">
+    <button id="btnListen" class="primary">開始聆聽</button>
     <button id="btnNow" title="不等停頓，立刻回答最近的聽眾問題">現在回答</button>
-    <meter id="levelTab" min="0" max="100" value="0" title="Meet 分頁音量"></meter>
-    <meter id="levelMic" min="0" max="100" value="0" title="麥克風音量"></meter>
+    <details class="settings">
+      <summary>設定</summary>
+      <div class="panel">
+        <label><input type="checkbox" id="withMic" checked> 也收我的麥克風</label>
+        <label><input type="checkbox" id="auto" checked> 自動擷取問題</label>
+        <a id="dlTranscript" href="#" hidden>下載逐字稿</a>
+        <a id="dlQa" href="#" hidden>下載問答紀錄</a>
+      </div>
+    </details>
   </div>
 </header>
-<div id="warn" class="warn" hidden></div>
-<main>
-  <section class="transcript">
-    <h2>逐字稿 <a id="dlTranscript" href="#" hidden>下載</a></h2>
-    <div id="lines"></div>
-    <div id="interim-聽眾" class="interim aud"></div>
-    <div id="interim-我" class="interim me"></div>
+<p id="warn" class="warn" role="alert" hidden></p>
+
+<main class="layout">
+  <section class="stage">
+    <button id="jumpLatest" class="jump" hidden>有新的回答，回到最新</button>
+    <article id="cue" class="cue empty" aria-live="polite">
+      <p class="cue-question"></p>
+      <p class="cue-speech">按「開始聆聽」，選 Meet 的分頁並打開「同時分享分頁音訊」。聽眾提問後，可以直接唸的回答會出現在這裡。</p>
+      <div class="cue-meta"></div>
+    </article>
+    <ol id="history" class="history" aria-label="先前的問題"></ol>
   </section>
-  <section class="answers">
-    <h2>口語稿 <a id="dlQa" href="#" hidden>下載問答紀錄</a></h2>
-    <div id="answers"><p class="empty">聽到聽眾提問後，口語稿會出現在這裡。</p></div>
-  </section>
+
+  <details class="transcript" open>
+    <summary>逐字稿</summary>
+    <div id="lines" class="lines"></div>
+    <p id="interim-聽眾" class="interim"></p>
+    <p id="interim-我" class="interim me"></p>
+  </details>
 </main>
-<form id="askForm">
-  <input id="askInput" placeholder="手動輸入問題，按 Enter 送出（自動辨識沒抓到時用）" autocomplete="off">
-  <button type="submit" class="primary">送出</button>
+
+<form id="askForm" class="ask">
+  <input id="askInput" placeholder="沒抓到的問題，打在這裡按 Enter" autocomplete="off" aria-label="手動輸入問題">
+  <button type="submit">送出</button>
 </form>
 <script src="/static/app.js"></script>
 </body>

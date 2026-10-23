@@ -1,16 +1,20 @@
 const TARGET_RATE = 16000;
 const TAB = 0, MIC = 1;  // first byte of each audio frame; the server maps them to 聽眾 / 我
 const $ = id => document.getElementById(id);
-const cards = new Map();
+const answers = new Map();  // id -> {raw, started, visible, done, citations, li}
 const captures = [];
-let ws;
+let ws, shownId = null, latestId = null, pinned = false, listening = false, thinking = false;
 
 function setStatus(text, kind = "") {
-  $("status").textContent = text;
-  $("status").className = "pill " + kind;
+  $("status").dataset.text = text;
+  $("status").className = "status " + kind;
+  paintStatus();
+}
+function paintStatus() {
+  const base = $("status").dataset.text || "";
+  $("status").textContent = thinking && listening ? base + "，正在判斷" : base;
 }
 function warn(text) { $("warn").hidden = !text; $("warn").textContent = text || ""; }
-
 // Same resampling and PCM16 packing as lecture_live_notes/static/app.js.
 function downsample(buffer, inRate, outRate) {
   if (inRate === outRate) return buffer;
@@ -37,8 +41,8 @@ function frame(channel, arr) {
 
 function connect() {
   ws = new WebSocket(`ws://${location.host}/ws`);
-  ws.onopen = () => setStatus("已連線，尚未聆聽");
-  ws.onclose = () => { setStatus("與伺服器斷線，3 秒後重連", "err"); setTimeout(connect, 3000); };
+  ws.onopen = () => setStatus(listening ? "聆聽中" : "已連線，還沒開始聆聽");
+  ws.onclose = () => { setStatus("和本機伺服器斷線，3 秒後重連", "err"); setTimeout(connect, 3000); };
   ws.onmessage = e => handle(JSON.parse(e.data));
 }
 
@@ -47,89 +51,131 @@ function handle(ev) {
     case "hello": {
       document.title = $("title").textContent = ev.title + " Q&A 助手";
       const problems = [];
-      if (!ev.anthropic_key) problems.push("沒有 Claude API key（填 talk-qa-assistant/.env 後重開），只會有逐字稿");
-      if (!ev.gemini_key) problems.push("沒有 Gemini API key");
+      if (!ev.anthropic_key) problems.push("沒有 Claude API key：在 talk-qa-assistant/.env 填好後重開，現在只會有逐字稿");
+      if (!ev.gemini_key) problems.push("沒有 Gemini API key：在 talk-qa-assistant/.env 填好後重開");
       if (ev.warm_error) problems.push("Claude 預熱失敗：" + ev.warm_error);
-      warn(problems.join("；"));
+      warn(problems.join("。"));
       $("dlTranscript").href = "/download/" + ev.transcript;
       $("dlQa").href = "/download/" + ev.qa;
       break;
     }
-    case "status": setStatus(ev.text, "on"); break;
+    case "status": if (listening) setStatus("聆聽中", "on"); break;
     case "error": warn(ev.text); break;
-    case "thinking": $("thinking").hidden = !ev.on; break;
-    case "interim": $("interim-" + ev.speaker).textContent = ev.speaker + "：" + ev.text; break;
+    case "thinking": thinking = ev.on; paintStatus(); break;
+    case "interim": { const el = $("interim-" + ev.speaker); if (el) el.textContent = ev.speaker + "：" + ev.text; break; }
     case "final": addLine(ev); break;
-    case "answer_start": cards.set(ev.id, {raw: "", el: null, started: performance.now()}); break;
-    case "answer_delta": { const c = cards.get(ev.id); c.raw += ev.text; render(c); break; }
+    case "answer_start": answers.set(ev.id, {id: ev.id, raw: "", started: performance.now()}); break;
+    case "answer_delta": { const a = answers.get(ev.id); a.raw += ev.text; update(a); break; }
     case "answer_done": finish(ev); break;
-    case "answer_error": { const c = cards.get(ev.id); c.raw = "【注意】" + ev.text; render(c, true); break; }
+    case "answer_error": { const a = answers.get(ev.id); a.raw = "【注意】" + ev.text; a.done = true; update(a, true); break; }
   }
 }
 
 function addLine(ev) {
-  const div = document.createElement("div");
-  div.className = "line " + (ev.speaker === "聽眾" ? "aud" : "me");
-  div.textContent = ev.line;
-  $("lines").append(div);
-  const interim = $("interim-" + ev.speaker);
+  const m = ev.line.match(/^\[(\d+:\d+)\] ([^：]+)：([\s\S]*)$/);
+  const [time, who, text] = m ? m.slice(1) : ["", ev.speaker, ev.line];
+  const box = $("lines");
+  const atBottom = box.parentElement.scrollHeight - box.parentElement.scrollTop - box.parentElement.clientHeight < 40;
+  const p = document.createElement("p");
+  p.className = "line" + (ev.speaker === "聽眾" ? "" : " me");
+  const tag = document.createElement("span");
+  tag.className = "who";
+  tag.textContent = `${who}　${time}`;
+  p.append(tag, document.createTextNode(text));
+  box.append(p);
+  const interim = $("interim-" + ev.speaker);  // typed questions have no interim line
   if (interim) interim.textContent = "";
   $("dlTranscript").hidden = false;
-  div.scrollIntoView({block: "end"});
+  if (atBottom) p.scrollIntoView({block: "end"});
 }
 
-// SKIP / WAIT replies never get a card; an answer gets one as soon as it starts streaming.
-function render(card, force = false) {
-  const head = card.raw.trimStart();
-  if (!force && !head.startsWith("【")) return;
-  if (!card.el) {
-    card.prev = document.querySelector(".card.newest");
-    document.querySelectorAll(".card.newest").forEach(el => el.classList.remove("newest"));
-    $("answers").querySelector(".empty")?.remove();
-    card.el = document.createElement("div");
-    card.el.className = "card newest";
-    for (const cls of ["meta", "body", "cites"]) {
-      const d = document.createElement("div");
-      d.className = cls;
-      card.el.append(d);
-    }
-    $("answers").prepend(card.el);
-  }
-  // An update replaces the card it updates: fold the previous one so each question has one live card.
-  // Decided once enough of the reply has streamed to see whether it starts with （更新）.
-  if (card.prev && card.updateChecked === undefined && head.length >= 8) {
-    card.updateChecked = /^【問題】\s*（更新）/.test(head);
-    if (card.updateChecked) card.prev.classList.add("folded");
-  }
-  const body = card.el.querySelector(".body");
-  body.textContent = "";
-  for (const part of head.split(/(?=【[^】]{1,4}】)/)) {
+// 【標籤】 sections of a reply; the model's text is only ever inserted with textContent.
+function sections(raw) {
+  const out = {};
+  for (const part of raw.trim().split(/(?=【[^】]{1,4}】)/)) {
     const m = part.match(/^【([^】]{1,4})】([\s\S]*)$/);
-    if (!m) continue;
-    const sec = document.createElement("div");
-    sec.className = "sec" + (m[1] === "口語稿" ? " speech" : m[1] === "問題" ? " question" : "");
-    const label = document.createElement("span");
-    label.className = "label";
-    label.textContent = m[1];
-    sec.append(label, document.createTextNode(m[2].trim()));
-    body.append(sec);
+    if (m) out[m[1]] = m[2].trim();
   }
+  return out;
+}
+
+// SKIP and WAIT never surface. An answer surfaces as soon as it starts streaming, takes the stage
+// unless the speaker pinned an older one, and an （更新） reply strikes out the entry it replaces.
+function update(a, force = false) {
+  if (!a.visible && (force || a.raw.trimStart().startsWith("【"))) {
+    a.visible = true;
+    a.replaces = latestId;
+    latestId = a.id;
+    a.li = document.createElement("li");
+    const btn = document.createElement("button");
+    btn.append(document.createElement("time"), document.createElement("span"));
+    btn.firstChild.textContent = new Date().toLocaleTimeString([], {hour: "2-digit", minute: "2-digit"});
+    btn.onclick = () => show(a, a.id !== latestId);
+    a.li.append(btn);
+    $("history").prepend(a.li);
+    if (pinned) $("jumpLatest").hidden = false; else show(a);
+  }
+  if (!a.visible) return;
+  const sec = sections(a.raw);
+  if (a.replaces && !a.updateChecked && sec["問題"] !== undefined && a.raw.length > 12) {
+    a.updateChecked = true;
+    if (sec["問題"].startsWith("（更新）")) answers.get(a.replaces)?.li?.classList.add("replaced");
+  }
+  a.li.querySelector("span").textContent = (sec["問題"] || "回答").replace(/^（更新）/, "更新：");
+  if (shownId === a.id) paint(a);
+}
+
+function show(a, pin = false) {
+  shownId = a.id;
+  pinned = pin;
+  document.querySelectorAll(".history li").forEach(li => li.classList.toggle("shown", li === a.li));
+  $("jumpLatest").hidden = !pin || a.id === latestId;
+  paint(a);
+}
+
+function paint(a) {
+  const sec = sections(a.raw);
+  const cue = $("cue");
+  cue.classList.remove("empty");
+  cue.classList.toggle("streaming", !a.done);
+  cue.querySelector(".cue-question").textContent = (sec["問題"] || "").replace(/^（更新）/, "更新：");
+  cue.querySelector(".cue-speech").textContent = sec["口語稿"] ?? "";
+  const meta = cue.querySelector(".cue-meta");
+  meta.textContent = "";
+  const add = (tag, cls, text) => {
+    if (!text) return;
+    const el = document.createElement(tag);
+    el.className = cls;
+    el.textContent = text;
+    meta.append(el);
+  };
+  add("p", "slide", sec["翻到"] && "翻到 " + sec["翻到"]);
+  add("p", "basis", sec["依據"]);
+  add("p", "caution", sec["注意"]);
+  if (a.done && a.citations?.length) {
+    const box = document.createElement("details");
+    box.className = "quotes";
+    const sum = document.createElement("summary");
+    sum.textContent = `原文引句（${a.citations.length}）`;
+    box.append(sum);
+    for (const c of a.citations) {
+      const q = document.createElement("p");
+      q.textContent = `第 ${c.page} 頁：${c.text}`;
+      box.append(q);
+    }
+    meta.append(box);
+  }
+  if (a.done && a.seconds) add("p", "timing", `${a.seconds} 秒產生`);
 }
 
 function finish(ev) {
-  const c = cards.get(ev.id);
-  if (ev.status === "skip" || ev.status === "wait") return;
-  if (ev.status === "refused") { c.raw = "【注意】模型拒答，請用自己的判斷回答。"; render(c, true); }
-  render(c, true);
-  if (!c.el) return;
-  const secs = ((performance.now() - c.started) / 1000).toFixed(1);
-  c.el.querySelector(".meta").textContent = `${new Date().toLocaleTimeString()} · ${secs}s`;
-  const cites = c.el.querySelector(".cites");
-  for (const cite of ev.citations) {
-    const d = document.createElement("div");
-    d.textContent = `原文 p.${cite.page}：「${cite.text}」`;
-    cites.append(d);
-  }
+  const a = answers.get(ev.id);
+  if (ev.status === "skip" || ev.status === "wait") { answers.delete(ev.id); return; }
+  if (ev.status === "refused") a.raw = "【注意】模型拒答這一題，請用自己的判斷回答。";
+  a.done = true;
+  a.citations = ev.citations;
+  a.seconds = ((performance.now() - a.started) / 1000).toFixed(1);
+  update(a, true);
   $("dlQa").hidden = false;
 }
 
@@ -198,8 +244,51 @@ async function stop() {
   setStatus("已停止聆聽");
 }
 
-$("btnStart").onclick = start;
-$("btnStop").onclick = stop;
+async function startListening() {
+  let tab;
+  try {
+    tab = await navigator.mediaDevices.getDisplayMedia({
+      video: {frameRate: 1},  // only the audio is used; keep the video stream cheap
+      audio: {echoCancellation: false, noiseSuppression: false, autoGainControl: false},
+      selfBrowserSurface: "exclude",
+    });
+  } catch (e) { warn("沒有選到 Meet 分頁，再按一次「開始聆聽」。（" + e.message + "）"); return; }
+  if (!tab.getAudioTracks().length) {
+    tab.getTracks().forEach(t => t.stop());
+    warn("收不到聲音：再按一次「開始聆聽」，選 Meet 的分頁，並打開「同時分享分頁音訊」。");
+    return;
+  }
+  warn("");
+  await capture(tab, TAB, "levelTab");
+  if ($("withMic").checked) {
+    try {
+      const mic = await navigator.mediaDevices.getUserMedia({audio: {channelCount: 1, echoCancellation: true}});
+      await capture(mic, MIC, "levelMic");
+    } catch (e) { warn("麥克風無法使用，只收 Meet 分頁。（" + e.message + "）"); }
+  }
+  listening = true;
+  $("btnListen").textContent = "停止聆聽";
+  $("btnListen").classList.add("live");
+  setStatus("聆聽中", "on");
+}
+
+async function stop() {
+  if (!captures.length) return;
+  ws.send(JSON.stringify({type: "stop"}));
+  for (const c of captures.splice(0)) {
+    c.stream.getTracks().forEach(t => t.stop());
+    c.processor.disconnect();
+    await c.ctx.close();
+    $(c.meterId).value = 0;
+  }
+  listening = false;
+  $("btnListen").textContent = "開始聆聽";
+  $("btnListen").classList.remove("live");
+  setStatus("已停止聆聽");
+}
+
+$("btnListen").onclick = () => (listening ? stop() : startListening());
+$("jumpLatest").onclick = () => show(answers.get(latestId));
 $("btnNow").onclick = () => ws.send(JSON.stringify({type: "answer_now"}));
 $("auto").onchange = e => ws.send(JSON.stringify({type: "auto", on: e.target.checked}));
 $("askForm").onsubmit = e => {
